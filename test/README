@@ -1,0 +1,24 @@
+
+This directory is intended for PlatformIO Test Runner and project tests.
+
+Unit Testing is a software testing method by which individual units of
+source code, sets of one or more MCU program modules together with associated
+control data, usage procedures, and operating procedures, are tested to
+determine whether they are fit for use. Unit testing finds problems early
+in the development cycle.
+
+More information about PlatformIO Unit Testing:
+- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+Fusion host test:
+
+    g++ -std=c++17 -Isrc test/fusion_filter_test.cpp \
+        src/domain/fusion/fusion_filter.cpp \
+        src/domain/geodesy/gps_to_xy.cpp -o .pio/fusion_filter_test.exe
+    .pio/fusion_filter_test.exe
+
+The test covers the south-west field origin, stationary propagation, the
+east-zero/counter-clockwise yaw convention, quaternion yaw integration,
+delayed GPS projection and course feedback, GPS and magnetic outlier
+rejection, encoder physical gating, sensor health hysteresis, long IMU gaps,
+and position/yaw usability expiry.
