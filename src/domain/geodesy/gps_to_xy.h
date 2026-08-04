@@ -5,11 +5,14 @@
 namespace Domain::Geodesy {
 
 // Converts WGS84 latitude/longitude to a local east/north tangent plane.
-// The origin is immutable after construction so every consumer uses the same
-// coordinate frame for the lifetime of the converter.
+// A surveyed reference point and its local XY are immutable after construction.
 class GpsToXY {
 public:
-    GpsToXY(int32_t origin_latitude_e7, int32_t origin_longitude_e7);
+    GpsToXY(
+        int32_t reference_latitude_e7,
+        int32_t reference_longitude_e7,
+        int32_t reference_x_mm,
+        int32_t reference_y_mm);
 
     bool valid() const;
 
@@ -21,8 +24,10 @@ public:
 
 private:
     bool valid_;
-    double origin_latitude_deg_;
-    double origin_longitude_deg_;
+    double reference_latitude_deg_;
+    double reference_longitude_deg_;
+    int32_t reference_x_mm_;
+    int32_t reference_y_mm_;
     double metres_per_radian_latitude_;
     double metres_per_radian_longitude_;
 };

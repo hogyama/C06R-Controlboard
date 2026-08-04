@@ -50,13 +50,14 @@ union Data {
     uint8_t raw_payload[6];
 };
 
-constexpr uint8_t TELEMETRY_PROTOCOL_VERSION = 4;
+constexpr uint8_t TELEMETRY_PROTOCOL_VERSION = 5;
 
 enum class TelemetryPage : uint8_t {
     Navigation = 0,
     Sensors = 1,
     Health = 2,
     Gps = 3,
+    Stuck = 4,
     Count
 };
 
@@ -151,6 +152,29 @@ struct TelemetryFrame {
             uint8_t nav_pvt_flags;
             uint8_t reserved[3];
         } __attribute__((packed)) gps;
+        struct {
+            uint16_t score_wheel_blocked;
+            uint16_t score_wheel_slip;
+            uint16_t score_rotation_blocked;
+            uint16_t score_body_trapped;
+            uint8_t verification_phase;
+            uint8_t trigger_reason;
+            uint8_t recurrence_count;
+            uint8_t verification_result;
+            uint8_t hash_distance_bits;
+            uint8_t gps_sample_count;
+            uint8_t diagnostics_valid;
+            uint8_t reserved;
+            int16_t probe_left_delta_mm;
+            int16_t probe_right_delta_mm;
+            int16_t probe_gyro_angle_mrad;
+            uint16_t tilt_deg_x10;
+            uint16_t gps_max_radius_mm;
+            uint16_t gps_encoder_distance_mm;
+            int16_t encoder_left_velocity_mm_s;
+            int16_t encoder_right_velocity_mm_s;
+            uint64_t camera_scene_hash;
+        } __attribute__((packed)) stuck;
         uint8_t raw[40];
     } data;
 } __attribute__((packed));

@@ -63,7 +63,9 @@ void taskCan(void *pvParameters) {
             case BootMode::SEQUENCE:
                 do{
                 // jog送信するのは、GPS_NAV,CAMERA_NAVのとき
-                if(state == SystemState::STATE_GPS_NAV || state == SystemState::STATE_CAMERA_NAV){
+                if(state == SystemState::STATE_GPS_NAV ||
+                   state == SystemState::STATE_CAMERA_NAV ||
+                   state == SystemState::STATE_STUCK_SUSPEND){
                     JogData jog = {};
                     if(xQueuePeek(mbx_can_jog_cmd, &jog, 0) == pdTRUE){
                         const uint32_t age_ms = static_cast<uint32_t>(millis() - jog.timestamp_ms);

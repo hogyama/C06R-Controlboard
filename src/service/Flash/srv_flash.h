@@ -93,7 +93,7 @@ static_assert(MAX_MAPS * SECTOR_SIZE == MAP_REGION_SIZE,
 namespace Flash {
     constexpr uint8_t MAP_FORMAT_VERSION = 2;
     constexpr uint8_t MAP_BITS_PER_CELL = 4;
-    constexpr uint8_t LOG_FORMAT_VERSION = 4;
+    constexpr uint8_t LOG_FORMAT_VERSION = 5;
 
     // 100 ms周期の新版ログ。packedにしてPC側とoffsetを固定する。
     struct LogFrame {
@@ -166,19 +166,29 @@ namespace Flash {
         uint16_t motion_anomaly_flags;
         uint16_t motion_anomaly_age_ms;
 
-        // NMEAとUBX-NAV-PVTを独立して記録し、受信経路を切り分ける。
-        int32_t nmea_lat_1e7;
-        int32_t nmea_lng_1e7;
-        uint16_t nmea_sentence_age_ms;
-        uint16_t nmea_location_age_ms;
-        uint16_t nmea_satellites_age_ms;
-        uint16_t nmea_hdop_x100;
-        uint8_t nmea_satellites;
-        uint8_t nmea_flags;
-        uint16_t nav_pvt_receive_age_ms;
+        uint16_t stuck_score_wheel_blocked;
+        uint16_t stuck_score_wheel_slip;
+        uint16_t stuck_score_rotation_blocked;
+        uint16_t stuck_score_body_trapped;
+        uint8_t stuck_verification_phase;
+        uint8_t stuck_trigger_reason;
+        uint8_t stuck_recurrence_count;
+        uint8_t stuck_verification_result;
+        uint8_t stuck_hash_distance_bits;
+        int16_t stuck_probe_left_delta_mm;
+        int16_t stuck_probe_right_delta_mm;
+        int16_t stuck_probe_gyro_angle_mrad;
+        uint16_t stuck_tilt_deg_x10;
+        uint16_t stuck_gps_max_radius_mm;
+        uint16_t stuck_gps_encoder_distance_mm;
+        uint8_t stuck_gps_sample_count;
+        uint8_t stuck_diagnostics_valid;
+        int16_t encoder_left_velocity_mm_s;
+        int16_t encoder_right_velocity_mm_s;
+        uint64_t camera_scene_hash;
     } __attribute__((packed));
 
-    static_assert(sizeof(LogFrame) == 156, "Flash LogFrame v4 size mismatch");
+    static_assert(sizeof(LogFrame) == 175, "Flash LogFrame v5 size mismatch");
 }
 
 class SrvFlash

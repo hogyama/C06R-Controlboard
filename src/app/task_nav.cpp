@@ -61,6 +61,12 @@ constexpr float CAMERA_FAR_FORWARD_SPEED_MM_S = 800.0f;
 constexpr float CAMERA_NEAR_FORWARD_SPEED_MM_S = 450.0f;
 constexpr uint16_t CAMERA_NEAR_OCCUPANCY_PERMILLE = 250;
 
+// 前進開始はトルク確保のため即時、減速だけを緩やかにする。
+// 300 mm/s未満は実機で駆動力を得にくいため、その時点で停止指令へ切り替える。
+constexpr float CAMERA_FORWARD_DECELERATION_MM_S2 = 2500.0f;
+constexpr float CAMERA_FORWARD_DECEL_STOP_SPEED_MM_S = 300.0f;
+constexpr uint32_t CAMERA_FORWARD_DECEL_MAX_DT_MS = 100;
+
 // taskNavが停止判断できなくなった場合にも短時間でJogを失効させる。
 constexpr uint32_t CAMERA_CONTROL_COMMAND_MS = 80;
 
@@ -94,6 +100,7 @@ enum class CameraPhase : uint8_t {
     TurnCoasting,
     StopSettling,
     Forward,
+    TranslationDecelerating,
     GoalConfirm,
     SearchTranslate,
     LinkHold,
@@ -474,6 +481,10 @@ void taskNav(void *pvParameters)
     float camera_right_velocity_mm_s = 0.0f;
     uint32_t camera_encoder_velocity_ms = 0;
 
+    // CAMERA_NAVの直進指令だけを保持し、停止前の減速に使用する。
+    float camera_forward_command_mm_s = 0.0f;
+    uint32_t camera_forward_command_ms = 0;
+
     bool camera_search_requested = false;
     float camera_search_accumulated_rad = 0.0f;
     uint8_t camera_search_leg_index = 0;
@@ -536,6 +547,10 @@ void taskNav(void *pvParameters)
         } else if (status.state == SystemState::STATE_ESCAPE ||
                    status.state == SystemState::STATE_UPRIGHT_RECOVERY) {
             active_command_source = MotionCommandSource::Escape;
+        } else if (status.state == SystemState::STATE_STUCK_SUSPEND) {
+            // taskStuck owns the bounded verification probe. Keep taskNav's
+            // stop request at the lowest priority so it cannot mask the probe.
+            active_command_source = MotionCommandSource::Stop;
         } else {
             active_command_source =
                 status.boot_mode != BootMode::MANUAL
@@ -579,6 +594,8 @@ void taskNav(void *pvParameters)
                 camera_left_velocity_mm_s = 0.0f;
                 camera_right_velocity_mm_s = 0.0f;
                 camera_encoder_velocity_ms = 0;
+                camera_forward_command_mm_s = 0.0f;
+                camera_forward_command_ms = 0;
                 camera_search_requested = false;
                 camera_search_accumulated_rad = 0.0f;
                 camera_search_leg_index = 0;
@@ -874,6 +891,15 @@ void taskNav(void *pvParameters)
                 camera_still_started_ms = 0;
             };
 
+            auto startTranslationDeceleration = [&] (
+                CameraAfterStop action) {
+                camera_phase = CameraPhase::TranslationDecelerating;
+                camera_after_stop = action;
+                camera_turn_purpose = CameraTurnPurpose::None;
+                camera_still_started_ms = 0;
+                camera_forward_command_ms = now_ms;
+            };
+
             Rasp::CameraData camera_data{};
             const bool has_frame =
                 xQueuePeek(mbx_camera_data, &camera_data, 0) == pdTRUE;
@@ -962,6 +988,8 @@ void taskNav(void *pvParameters)
                         camera_phase != CameraPhase::GoalConfirm) {
                         // 走行中の最初の候補は数えず、完全静止後の次フレームから数える。
                         publishStop();
+                        camera_forward_command_mm_s = 0.0f;
+                        camera_forward_command_ms = now_ms;
                         camera_phase = CameraPhase::StopSettling;
                         camera_after_stop =
                             CameraAfterStop::StartGoalConfirm;
@@ -1082,22 +1110,26 @@ void taskNav(void *pvParameters)
                             camera_coarse_forward_active
                                 ? CAMERA_COARSE_FORWARD_DEAD_BAND_DEG10
                                 : CAMERA_FORWARD_DEAD_BAND_DEG10;
-                        if (abs(camera_filtered_angle_deg10) >
-                                allowed_angle_deg10 ||
-                            frame.occupancy_permille >=
+                        if (frame.occupancy_permille >=
                                 CAMERA_GOAL_OCCUPANCY_PERMILLE) {
                             publishStop();
+                            camera_forward_command_mm_s = 0.0f;
+                            camera_forward_command_ms = now_ms;
                             camera_phase = CameraPhase::StopSettling;
                             camera_after_stop = CameraAfterStop::WaitFrame;
                             camera_target_confirm_count = 0;
                             camera_still_started_ms = 0;
+                        } else if (abs(camera_filtered_angle_deg10) >
+                                   allowed_angle_deg10) {
+                            // 通常の再撮影停止は急停止せず、短い減速を挟む。
+                            startTranslationDeceleration(
+                                CameraAfterStop::WaitFrame);
+                            camera_target_confirm_count = 0;
                         }
                     } else if (
                         camera_phase == CameraPhase::SearchTranslate) {
-                        publishStop();
-                        camera_phase = CameraPhase::StopSettling;
-                        camera_after_stop = CameraAfterStop::WaitFrame;
-                        camera_still_started_ms = 0;
+                        startTranslationDeceleration(
+                            CameraAfterStop::WaitFrame);
                     }
                 } else {
                     // 探索へ進むのは、通信の鮮度切れではなく明示的な未検出だけ。
@@ -1112,11 +1144,18 @@ void taskNav(void *pvParameters)
                     if (camera_phase == CameraPhase::Forward ||
                         camera_phase == CameraPhase::SearchTranslate ||
                         camera_phase == CameraPhase::GoalConfirm) {
-                        publishStop();
-                        camera_phase = CameraPhase::StopSettling;
-                        camera_after_stop = CameraAfterStop::StartSearch;
-                        camera_turn_purpose = CameraTurnPurpose::None;
-                        camera_still_started_ms = 0;
+                        if (camera_phase == CameraPhase::GoalConfirm) {
+                            publishStop();
+                            camera_forward_command_mm_s = 0.0f;
+                            camera_forward_command_ms = now_ms;
+                            camera_phase = CameraPhase::StopSettling;
+                            camera_after_stop = CameraAfterStop::StartSearch;
+                            camera_turn_purpose = CameraTurnPurpose::None;
+                            camera_still_started_ms = 0;
+                        } else {
+                            startTranslationDeceleration(
+                                CameraAfterStop::StartSearch);
+                        }
                     } else if (camera_phase == CameraPhase::WaitFrame) {
                         if (camera_still_confirmed) {
                             startCameraTurn(
@@ -1141,6 +1180,8 @@ void taskNav(void *pvParameters)
             // 1200ms通信断では途中の制御判断を破棄し、復帰後の新規フレームを待つ。
             if (camera_frame_age_ms > CAMERA_COMM_TIMEOUT_MS) {
                 publishStop();
+                camera_forward_command_mm_s = 0.0f;
+                camera_forward_command_ms = now_ms;
                 camera_phase = CameraPhase::LinkHold;
                 camera_after_stop = CameraAfterStop::WaitFrame;
                 camera_turn_purpose = CameraTurnPurpose::None;
@@ -1162,8 +1203,11 @@ void taskNav(void *pvParameters)
             if (camera_frame_age_ms > CAMERA_CONTROL_FRAME_TIMEOUT_MS &&
                 (camera_phase == CameraPhase::TurnDriving ||
                  camera_phase == CameraPhase::Forward ||
-                 camera_phase == CameraPhase::SearchTranslate)) {
+                 camera_phase == CameraPhase::SearchTranslate ||
+                 camera_phase == CameraPhase::TranslationDecelerating)) {
                 publishStop();
+                camera_forward_command_mm_s = 0.0f;
+                camera_forward_command_ms = now_ms;
                 camera_phase = CameraPhase::StopSettling;
                 camera_after_stop = CameraAfterStop::WaitFrame;
                 camera_turn_purpose = CameraTurnPurpose::None;
@@ -1240,6 +1284,8 @@ void taskNav(void *pvParameters)
 
             if (camera_phase == CameraPhase::StopSettling) {
                 publishStop();
+                camera_forward_command_mm_s = 0.0f;
+                camera_forward_command_ms = now_ms;
                 if (!camera_still_confirmed) continue;
 
                 const CameraAfterStop action = camera_after_stop;
@@ -1263,6 +1309,8 @@ void taskNav(void *pvParameters)
                 if (!camera_has_encoder ||
                     !camera_encoder_velocity_usable) {
                     publishStop();
+                    camera_forward_command_mm_s = 0.0f;
+                    camera_forward_command_ms = now_ms;
                     continue;
                 }
                 const float left_distance_mm = static_cast<float>(
@@ -1273,17 +1321,48 @@ void taskNav(void *pvParameters)
                     0.5f * (left_distance_mm + right_distance_mm));
 
                 if (travelled_mm >= camera_search_target_distance_mm) {
-                    publishStop();
                     if (camera_search_leg_index < UINT8_MAX) {
                         ++camera_search_leg_index;
                     }
                     camera_search_accumulated_rad = 0.0f;
+                    startTranslationDeceleration(
+                        CameraAfterStop::WaitFrame);
+                } else {
+                    camera_forward_command_mm_s =
+                        CAMERA_SEARCH_MOVE_SPEED_MM_S;
+                    camera_forward_command_ms = now_ms;
+                    publishJog(
+                        camera_forward_command_mm_s,
+                        0.0f,
+                        CAMERA_CONTROL_COMMAND_MS);
+                }
+                continue;
+            }
+
+            if (camera_phase == CameraPhase::TranslationDecelerating) {
+                const uint32_t elapsed_ms = camera_forward_command_ms != 0U
+                    ? static_cast<uint32_t>(now_ms - camera_forward_command_ms)
+                    : NAV_PERIOD_MS;
+                const uint32_t limited_elapsed_ms = elapsed_ms >
+                        CAMERA_FORWARD_DECEL_MAX_DT_MS
+                    ? CAMERA_FORWARD_DECEL_MAX_DT_MS
+                    : elapsed_ms;
+                camera_forward_command_mm_s = fmaxf(
+                    0.0f,
+                    camera_forward_command_mm_s -
+                        CAMERA_FORWARD_DECELERATION_MM_S2 *
+                        static_cast<float>(limited_elapsed_ms) * 0.001f);
+                camera_forward_command_ms = now_ms;
+
+                if (camera_forward_command_mm_s <=
+                    CAMERA_FORWARD_DECEL_STOP_SPEED_MM_S) {
+                    camera_forward_command_mm_s = 0.0f;
+                    publishStop();
                     camera_phase = CameraPhase::StopSettling;
-                    camera_after_stop = CameraAfterStop::WaitFrame;
                     camera_still_started_ms = 0;
                 } else {
                     publishJog(
-                        CAMERA_SEARCH_MOVE_SPEED_MM_S,
+                        camera_forward_command_mm_s,
                         0.0f,
                         CAMERA_CONTROL_COMMAND_MS);
                 }
@@ -1293,15 +1372,36 @@ void taskNav(void *pvParameters)
             if (camera_phase == CameraPhase::Forward) {
                 if (!has_frame || frame.target_found == 0) {
                     publishStop();
+                    camera_forward_command_mm_s = 0.0f;
+                    camera_forward_command_ms = now_ms;
                 } else {
-                    const float forward_speed = camera_coarse_forward_active
+                    const float target_forward_speed = camera_coarse_forward_active
                         ? CAMERA_NEAR_FORWARD_SPEED_MM_S
                         : (frame.occupancy_permille <
                             CAMERA_NEAR_OCCUPANCY_PERMILLE
                             ? CAMERA_FAR_FORWARD_SPEED_MM_S
                             : CAMERA_NEAR_FORWARD_SPEED_MM_S);
+
+                    // 加速は即時、800->450など速度を下げる側だけ減速率を適用する。
+                    const uint32_t elapsed_ms = camera_forward_command_ms != 0U
+                        ? static_cast<uint32_t>(now_ms - camera_forward_command_ms)
+                        : NAV_PERIOD_MS;
+                    const uint32_t limited_elapsed_ms = elapsed_ms >
+                            CAMERA_FORWARD_DECEL_MAX_DT_MS
+                        ? CAMERA_FORWARD_DECEL_MAX_DT_MS
+                        : elapsed_ms;
+                    if (camera_forward_command_mm_s > target_forward_speed) {
+                        camera_forward_command_mm_s = fmaxf(
+                            target_forward_speed,
+                            camera_forward_command_mm_s -
+                                CAMERA_FORWARD_DECELERATION_MM_S2 *
+                                static_cast<float>(limited_elapsed_ms) * 0.001f);
+                    } else {
+                        camera_forward_command_mm_s = target_forward_speed;
+                    }
+                    camera_forward_command_ms = now_ms;
                     publishJog(
-                        forward_speed,
+                        camera_forward_command_mm_s,
                         0.0f,
                         CAMERA_CONTROL_COMMAND_MS);
                 }

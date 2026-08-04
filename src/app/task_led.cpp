@@ -74,6 +74,9 @@ bool stateLedOn(SystemState state, uint32_t now_ms)
         case SystemState::STATE_ESCAPE:
             return (now_ms % 200U) < 100U;
 
+        case SystemState::STATE_STUCK_SUSPEND:
+            return (now_ms % 1000U) < 500U;
+
         case SystemState::STATE_UPRIGHT_RECOVERY:
             return (now_ms % 100U) < 50U;
 

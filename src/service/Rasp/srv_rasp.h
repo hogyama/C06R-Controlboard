@@ -14,12 +14,13 @@ namespace Rasp
         int16_t angle_error_deg10;
         uint16_t occupancy_permille;
         uint8_t confidence;
+        uint64_t scene_hash;
         uint8_t checksum;
     };
 
     static_assert(
-        sizeof(Frame) == 12,
-        "Rasp::Frame must be 12 bytes"
+        sizeof(Frame) == 20,
+        "Rasp::Frame must be 20 bytes"
     );
 
     // Raspberry Piから受信したフレームにESP32側の受信時刻を付加する。
@@ -86,6 +87,9 @@ public:
 
     // Starts periodic camera-frame requests after initial readiness.
     bool startCameraReception();
+
+    // Stops periodic requests without powering the Raspberry Pi off.
+    void stopCameraReception();
 
     // Powers the Pi on and resets communication state.
     bool powerOn();

@@ -73,6 +73,7 @@ void taskState(void *pvParameters)
 
     SystemData system_data{SystemState::STATE_PRELAUNCH, boot_mode};
     bool force_camera_nav = false;
+    SystemState suspended_navigation_state = SystemState::STATE_GPS_NAV;
     uint32_t escape_started_ms = 0;
     uint32_t normal_attitude_started_ms = 0;
     bool upright_stop_sent = false;
@@ -208,7 +209,9 @@ void taskState(void *pvParameters)
 
                 case SystemCmdType::NotifyStuck:
                     if (system_data.state == SystemState::STATE_GPS_NAV ||
-                        system_data.state == SystemState::STATE_CAMERA_NAV) {
+                        system_data.state == SystemState::STATE_CAMERA_NAV ||
+                        system_data.state ==
+                            SystemState::STATE_STUCK_SUSPEND) {
                         queueCanAction(command);
                         system_data.state = SystemState::STATE_ESCAPE;
                         escape_started_ms = now_ms;
@@ -217,9 +220,27 @@ void taskState(void *pvParameters)
                     }
                     break;
 
-                case SystemCmdType::NotifyFlipped:
+                case SystemCmdType::RequestStuckSuspend:
                     if (system_data.state == SystemState::STATE_GPS_NAV ||
                         system_data.state == SystemState::STATE_CAMERA_NAV) {
+                        suspended_navigation_state = system_data.state;
+                        system_data.state =
+                            SystemState::STATE_STUCK_SUSPEND;
+                    }
+                    break;
+
+                case SystemCmdType::StuckVerificationRejected:
+                    if (system_data.state ==
+                        SystemState::STATE_STUCK_SUSPEND) {
+                        system_data.state = suspended_navigation_state;
+                    }
+                    break;
+
+                case SystemCmdType::NotifyFlipped:
+                    if (system_data.state == SystemState::STATE_GPS_NAV ||
+                        system_data.state == SystemState::STATE_CAMERA_NAV ||
+                        system_data.state ==
+                            SystemState::STATE_STUCK_SUSPEND) {
                         queueCanAction(command);
                         system_data.state = SystemState::STATE_UPRIGHT_RECOVERY;
                         escape_started_ms = now_ms;

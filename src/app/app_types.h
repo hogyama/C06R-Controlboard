@@ -41,7 +41,10 @@ enum class SystemState : uint8_t {
     STATE_GOAL,
     // 反転検出後、正常姿勢500ms確認とU送信、完了/失敗通知待ちを行う。
     // 既存ログとの互換性を保つため、従来状態0-7の末尾へ追加する。
-    STATE_UPRIGHT_RECOVERY = 8
+    STATE_UPRIGHT_RECOVERY = 8,
+    // Navigation is paused while taskStuck performs a bounded motion/image
+    // verification. Keep the value appended for flash/telemetry compatibility.
+    STATE_STUCK_SUSPEND = 9
 };
 
 enum class BootMode : uint8_t {
@@ -71,6 +74,8 @@ enum class SystemCmdType : uint8_t {
     NotifySeparation, 
     NotifyStuck, 
     NotifyFlipped,
+    RequestStuckSuspend,
+    StuckVerificationRejected,
     ConfirmUpright,
     ServoUnlock, 
     ServoLock, 
@@ -100,6 +105,7 @@ enum class MotionCommandSource : uint8_t {
     CameraNavigation,
     Escape,
     Manual,
+    StuckVerification,
     Safety
 };
 
@@ -193,6 +199,32 @@ struct StuckStatus {
     uint8_t obstacle_cell_x; // 0-63、障害物登録なしは255
     uint8_t obstacle_cell_y; // 0-63、障害物登録なしは255
     uint32_t timestamp_ms;
+};
+
+// Live detector/verifier telemetry. This is separate from StuckStatus because
+// a suspected reason must not be mistaken for a confirmed obstacle.
+struct StuckDiagnostics {
+    uint32_t timestamp_ms;
+    Domain::Motion::StuckScores scores;
+    uint8_t verification_phase;
+    StuckReason trigger_reason;
+    uint8_t recurrence_count[4];
+    uint8_t verification_attempt;
+    uint8_t verification_stuck_votes;
+    uint8_t verification_result; // 0:none, 1:stuck, 2:moved, 3:inconclusive
+    uint8_t hash_distance_bits;  // 255 until a comparison is available
+    uint64_t hash_before;
+    uint64_t hash_after;
+    int16_t probe_left_delta_mm;
+    int16_t probe_right_delta_mm;
+    int16_t probe_gyro_angle_mrad;
+    uint16_t tilt_deg_x10;
+    uint16_t gps_window_age_ms;
+    uint16_t gps_max_radius_mm;
+    uint16_t gps_encoder_distance_mm;
+    uint8_t gps_sample_count;
+    int16_t encoder_left_velocity_mm_s;
+    int16_t encoder_right_velocity_mm_s;
 };
 
 enum class FlashDebugRequestType : uint8_t {

@@ -123,6 +123,8 @@ struct GpsUpdate {
     int32_t velocity_north_mm_s;
     int32_t velocity_east_mm_s;
     uint32_t speed_accuracy_mm_s;
+    // NAV-PVTだけが速度を持つ。NMEA位置に0速度を仮定しない。
+    bool velocity_valid;
     uint8_t fix_type;
     bool fix_ok;
 };

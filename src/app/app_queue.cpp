@@ -20,6 +20,7 @@ QueueHandle_t mbx_twe_telemetry = nullptr;
 QueueHandle_t mbx_camera_data = nullptr;
 QueueHandle_t mbx_flash_log = nullptr;
 QueueHandle_t mbx_stuck_status = nullptr;
+QueueHandle_t mbx_stuck_diagnostics = nullptr;
 QueueHandle_t fifo_flash_debug_request = nullptr;
 QueueHandle_t mbx_flash_debug_response = nullptr;
 QueueHandle_t mbx_flash_nav_response = nullptr;
@@ -55,6 +56,7 @@ bool appInitQueues() {
     mbx_camera_data = xQueueCreate(1, sizeof(Rasp::CameraData));
     mbx_flash_log = xQueueCreate(1, sizeof(Flash::LogFrame));
     mbx_stuck_status = xQueueCreate(1, sizeof(StuckStatus));
+    mbx_stuck_diagnostics = xQueueCreate(1, sizeof(StuckDiagnostics));
     fifo_flash_debug_request = xQueueCreate(2, sizeof(FlashDebugRequest));
     mbx_flash_debug_response = xQueueCreate(1, sizeof(FlashDebugResponse));
     mbx_flash_nav_response = xQueueCreate(1, sizeof(FlashDebugResponse));
@@ -82,6 +84,7 @@ bool appInitQueues() {
         mbx_camera_data != nullptr &&
         mbx_flash_log != nullptr &&
         mbx_stuck_status != nullptr &&
+        mbx_stuck_diagnostics != nullptr &&
         fifo_flash_debug_request != nullptr &&
         mbx_flash_debug_response != nullptr &&
         mbx_flash_nav_response != nullptr &&

@@ -7,11 +7,26 @@ namespace Domain::Motion {
 
 namespace {
 
-uint8_t countTrue(bool a, bool b, bool c)
+uint16_t saturatingStep(
+    uint16_t value,
+    uint16_t rate_per_s,
+    uint32_t dt_ms,
+    uint16_t maximum,
+    bool increase)
 {
-    return static_cast<uint8_t>(a) +
-        static_cast<uint8_t>(b) +
-        static_cast<uint8_t>(c);
+    uint32_t step =
+        (static_cast<uint32_t>(rate_per_s) * dt_ms + 999U) / 1000U;
+    if (step == 0U && dt_ms != 0U) step = 1U;
+    if (increase) {
+        const uint32_t sum = static_cast<uint32_t>(value) + step;
+        return static_cast<uint16_t>(sum > maximum ? maximum : sum);
+    }
+    return static_cast<uint16_t>(step >= value ? 0U : value - step);
+}
+
+float radiansToDegrees(float radians)
+{
+    return radians * 57.2957795f;
 }
 
 } // namespace
@@ -24,64 +39,21 @@ StuckDetector::StuckDetector(const DetectorConfig& config)
 
 void StuckDetector::reset(uint32_t timestamp_ms)
 {
-    memset(candidate_since_ms_, 0, sizeof(candidate_since_ms_));
-    memset(candidate_active_ms_, 0, sizeof(candidate_active_ms_));
     command_active_ms_ = 0;
     last_motion_command_ms_ = timestamp_ms;
     last_gps_seen_ms_ = 0;
     resetGpsWindow();
-    resetPathWindow();
-    resetOscillationWindow();
-    previous_fusion_x_mm_ = 0;
-    previous_fusion_y_mm_ = 0;
-    have_previous_fusion_position_ = false;
+    scores_ = {};
+    body_tilt_active_ms_ = 0;
+    memset(gravity_body_g_, 0, sizeof(gravity_body_g_));
+    have_gravity_ = false;
+    current_tilt_deg_ = 0.0f;
+    suspend_latched_ = false;
 }
 
 float StuckDetector::absolute(float value)
 {
     return value < 0.0f ? -value : value;
-}
-
-int8_t StuckDetector::signWithDeadband(float value, float deadband)
-{
-    if (value > deadband) return 1;
-    if (value < -deadband) return -1;
-    return 0;
-}
-
-uint8_t StuckDetector::reasonIndex(Reason reason)
-{
-    const uint8_t index = static_cast<uint8_t>(reason);
-    return index < REASON_COUNT ? index : 0;
-}
-
-bool StuckDetector::confirmCandidate(
-    Reason reason,
-    bool suspected,
-    uint32_t required_ms,
-    uint32_t now_ms,
-    uint32_t active_dt_ms)
-{
-    const uint8_t index = reasonIndex(reason);
-    if (!suspected) {
-        candidate_since_ms_[index] = 0;
-        candidate_active_ms_[index] = 0;
-        return false;
-    }
-    if (candidate_since_ms_[index] == 0) {
-        candidate_since_ms_[index] = now_ms;
-    }
-    const uint32_t remaining =
-        UINT32_MAX - candidate_active_ms_[index];
-    candidate_active_ms_[index] +=
-        active_dt_ms < remaining ? active_dt_ms : remaining;
-    return candidate_active_ms_[index] >= required_ms;
-}
-
-void StuckDetector::clearCandidates()
-{
-    memset(candidate_since_ms_, 0, sizeof(candidate_since_ms_));
-    memset(candidate_active_ms_, 0, sizeof(candidate_active_ms_));
 }
 
 void StuckDetector::resetGpsWindow()
@@ -90,33 +62,84 @@ void StuckDetector::resetGpsWindow()
     gps_start_x_mm_ = 0;
     gps_start_y_mm_ = 0;
     gps_max_radius_mm_ = 0.0f;
-    gps_expected_mm_ = 0.0f;
     gps_encoder_mm_ = 0.0f;
     gps_sample_count_ = 0;
     gps_window_active_ = false;
 }
 
-void StuckDetector::resetPathWindow()
+void StuckDetector::updateScore(
+    uint16_t& score,
+    bool evidence,
+    bool healthy,
+    uint16_t rise_per_s,
+    uint32_t dt_ms)
 {
-    path_window_started_ms_ = 0;
-    path_revision_ = 0;
-    path_start_index_ = 0;
-    path_start_goal_distance_mm_ = 0.0f;
-    path_commanded_mm_ = 0.0f;
-    path_window_active_ = false;
+    if (evidence) {
+        score = saturatingStep(
+            score, rise_per_s, dt_ms, config_.score_maximum, true);
+    } else {
+        score = saturatingStep(
+            score,
+            healthy ? config_.healthy_decay_per_s
+                    : config_.neutral_decay_per_s,
+            dt_ms,
+            config_.score_maximum,
+            false);
+    }
 }
 
-void StuckDetector::resetOscillationWindow()
+uint16_t StuckDetector::scoreForReason(Reason reason) const
 {
-    oscillation_window_started_ms_ = 0;
-    oscillation_start_x_mm_ = 0;
-    oscillation_start_y_mm_ = 0;
-    oscillation_max_radius_mm_ = 0.0f;
-    oscillation_motion_mm_ = 0.0f;
-    oscillation_reversals_ = 0;
-    previous_translation_sign_ = 0;
-    previous_rotation_sign_ = 0;
-    oscillation_window_active_ = false;
+    switch (reason) {
+        case Reason::WheelBlocked: return scores_.wheel_blocked;
+        case Reason::WheelSlip: return scores_.wheel_slip;
+        case Reason::RotationBlocked: return scores_.rotation_blocked;
+        case Reason::BodyTrapped: return scores_.body_trapped;
+        default: return 0;
+    }
+}
+
+StuckScores StuckDetector::scores() const
+{
+    return scores_;
+}
+
+DetectorDiagnostics StuckDetector::diagnostics(uint32_t timestamp_ms) const
+{
+    const auto saturatedU16 = [](float value) -> uint16_t {
+        if (!isfinite(value) || value <= 0.0f) return 0;
+        if (value >= 65535.0f) return UINT16_MAX;
+        return static_cast<uint16_t>(lroundf(value));
+    };
+
+    DetectorDiagnostics result{};
+    result.tilt_deg_x10 = saturatedU16(current_tilt_deg_ * 10.0f);
+    result.gps_window_age_ms = gps_window_active_
+        ? saturatedU16(static_cast<float>(
+            static_cast<uint32_t>(timestamp_ms - gps_window_started_ms_)))
+        : 0;
+    result.gps_max_radius_mm = saturatedU16(gps_max_radius_mm_);
+    result.gps_encoder_distance_mm = saturatedU16(gps_encoder_mm_);
+    result.gps_sample_count = gps_sample_count_;
+    return result;
+}
+
+void StuckDetector::completeVerification(
+    Reason reason,
+    bool movement_confirmed)
+{
+    uint16_t* score = nullptr;
+    switch (reason) {
+        case Reason::WheelBlocked: score = &scores_.wheel_blocked; break;
+        case Reason::WheelSlip: score = &scores_.wheel_slip; break;
+        case Reason::RotationBlocked: score = &scores_.rotation_blocked; break;
+        case Reason::BodyTrapped: score = &scores_.body_trapped; break;
+        default: break;
+    }
+    if (score != nullptr) {
+        *score = movement_confirmed ? 0U : config_.rearm_score;
+    }
+    suspend_latched_ = false;
 }
 
 Assessment StuckDetector::update(const DetectorSample& sample)
@@ -129,9 +152,8 @@ Assessment StuckDetector::update(const DetectorSample& sample)
     assessment.gps_trusted = sample.gps_available;
     assessment.gyro_trusted = sample.gyro_available;
 
-    const float dt_s =
-        static_cast<float>(sample.dt_ms > 200U ? 200U : sample.dt_ms) *
-        0.001f;
+    const uint32_t dt_ms = sample.dt_ms > 200U ? 200U : sample.dt_ms;
+    const float dt_s = static_cast<float>(dt_ms) * 0.001f;
     const bool translation_commanded =
         sample.command_valid &&
         absolute(sample.command_velocity_mm_s) >=
@@ -140,40 +162,88 @@ Assessment StuckDetector::update(const DetectorSample& sample)
         sample.command_valid &&
         absolute(sample.command_yaw_rate_rad_s) >=
             config_.minimum_rotation_command_rad_s;
-    const bool motion_commanded =
-        translation_commanded || rotation_commanded;
+    const bool motion_commanded = translation_commanded || rotation_commanded;
 
     if (!sample.navigation_active) {
         reset(sample.timestamp_ms);
+        assessment.scores = scores_;
         return assessment;
     }
 
-    if (!motion_commanded) {
-        if (last_motion_command_ms_ == 0U ||
+    if (motion_commanded) {
+        if (last_motion_command_ms_ != 0U &&
             static_cast<uint32_t>(
                 sample.timestamp_ms - last_motion_command_ms_) >
                 config_.command_gap_reset_ms) {
-            reset(sample.timestamp_ms);
+            command_active_ms_ = 0;
+            resetGpsWindow();
         }
-        return assessment;
+        last_motion_command_ms_ = sample.timestamp_ms;
+        const uint32_t room = UINT32_MAX - command_active_ms_;
+        command_active_ms_ += dt_ms < room ? dt_ms : room;
+    } else {
+        command_active_ms_ = 0;
+        resetGpsWindow();
+    }
+    const bool armed = command_active_ms_ >= config_.command_arm_ms;
+
+    const float left_command = sample.command_velocity_mm_s -
+        sample.command_yaw_rate_rad_s * config_.half_track_mm;
+    const float right_command = sample.command_velocity_mm_s +
+        sample.command_yaw_rate_rad_s * config_.half_track_mm;
+    const float rotation_equivalent_mm_s =
+        absolute(sample.command_yaw_rate_rad_s) * config_.half_track_mm;
+    const bool translation_dominant =
+        translation_commanded &&
+        absolute(sample.command_velocity_mm_s) > rotation_equivalent_mm_s;
+    const bool rotation_dominant =
+        rotation_commanded &&
+        rotation_equivalent_mm_s >= absolute(sample.command_velocity_mm_s);
+
+    const bool left_commanded =
+        absolute(left_command) >= config_.minimum_wheel_command_mm_s;
+    const bool right_commanded =
+        absolute(right_command) >= config_.minimum_wheel_command_mm_s;
+    const float left_stopped_threshold = fmaxf(
+        config_.stopped_velocity_mm_s,
+        absolute(left_command) * config_.stopped_ratio);
+    const float right_stopped_threshold = fmaxf(
+        config_.stopped_velocity_mm_s,
+        absolute(right_command) * config_.stopped_ratio);
+    const bool left_stopped =
+        sample.encoder_available && left_commanded &&
+        absolute(sample.encoder_left_velocity_mm_s) < left_stopped_threshold;
+    const bool right_stopped =
+        sample.encoder_available && right_commanded &&
+        absolute(sample.encoder_right_velocity_mm_s) < right_stopped_threshold;
+    const bool left_moving =
+        sample.encoder_available && left_commanded &&
+        sample.encoder_left_velocity_mm_s * left_command > 0.0f &&
+        absolute(sample.encoder_left_velocity_mm_s) >=
+            absolute(left_command) * config_.moving_ratio;
+    const bool right_moving =
+        sample.encoder_available && right_commanded &&
+        sample.encoder_right_velocity_mm_s * right_command > 0.0f &&
+        absolute(sample.encoder_right_velocity_mm_s) >=
+            absolute(right_command) * config_.moving_ratio;
+
+    if (sample.encoder_available) {
+        assessment.evidence_flags |=
+            (left_stopped || right_stopped)
+                ? EVIDENCE_ENCODER_NOT_MOVING
+                : EVIDENCE_ENCODER_MOVING;
+        if (left_stopped != right_stopped) {
+            assessment.evidence_flags |= EVIDENCE_LEFT_RIGHT_MISMATCH;
+        }
+    } else {
+        assessment.evidence_flags |= EVIDENCE_ENCODER_UNAVAILABLE;
     }
 
-    if (last_motion_command_ms_ != 0U &&
-        static_cast<uint32_t>(
-            sample.timestamp_ms - last_motion_command_ms_) >
-            config_.command_gap_reset_ms) {
-        reset();
-    }
-    last_motion_command_ms_ = sample.timestamp_ms;
-    const uint32_t active_dt_ms =
-        sample.dt_ms > 200U ? 200U : sample.dt_ms;
-    const uint32_t command_remaining =
-        UINT32_MAX - command_active_ms_;
-    command_active_ms_ +=
-        active_dt_ms < command_remaining
-            ? active_dt_ms
-            : command_remaining;
-    const bool armed = command_active_ms_ >= config_.command_arm_ms;
+    const bool wheel_blocked_evidence =
+        armed && translation_dominant && sample.encoder_available &&
+        (left_stopped || right_stopped);
+    const bool wheel_blocked_healthy =
+        translation_dominant && left_moving && right_moving;
 
     const float encoder_velocity = 0.5f *
         (sample.encoder_left_velocity_mm_s +
@@ -182,473 +252,223 @@ Assessment StuckDetector::update(const DetectorSample& sample)
         (sample.encoder_right_velocity_mm_s -
          sample.encoder_left_velocity_mm_s) /
         (2.0f * config_.half_track_mm);
+    const float encoder_delta_mm = absolute(encoder_velocity) * dt_s;
 
-    if (sample.encoder_available) {
-        assessment.evidence_flags |=
-            absolute(encoder_velocity) <
-                    config_.stopped_velocity_mm_s
-                ? EVIDENCE_ENCODER_NOT_MOVING
-                : EVIDENCE_ENCODER_MOVING;
-    } else {
-        assessment.evidence_flags |= EVIDENCE_ENCODER_UNAVAILABLE;
-    }
-    if (sample.gyro_available) {
-        assessment.evidence_flags |=
-            absolute(sample.gyro_yaw_rate_rad_s) <
-                    config_.stopped_yaw_rate_rad_s
-                ? EVIDENCE_GYRO_NOT_ROTATING
-                : EVIDENCE_GYRO_ROTATING;
-    } else {
-        assessment.evidence_flags |= EVIDENCE_GYRO_UNAVAILABLE;
-    }
-    const bool fusion_translation_available =
-        sample.fusion_available && sample.fusion_position_usable;
-    const bool fusion_rotation_available =
-        sample.fusion_available && sample.fusion_yaw_usable;
-    if (fusion_translation_available) {
-        assessment.evidence_flags |=
-            absolute(sample.fusion_forward_velocity_mm_s) <
-                    config_.stopped_velocity_mm_s
-                ? EVIDENCE_FUSION_NOT_MOVING
-                : EVIDENCE_FUSION_MOVING;
-    } else {
-        assessment.evidence_flags |= EVIDENCE_FUSION_UNAVAILABLE;
-    }
+    const bool gps_reliable =
+        sample.gps_available &&
+        sample.gps_horizontal_accuracy_mm <=
+            config_.gps_maximum_accuracy_mm;
     if (!sample.gps_available) {
         assessment.evidence_flags |= EVIDENCE_GPS_UNAVAILABLE;
     }
 
-    float fusion_delta_mm = 0.0f;
-    if (sample.fusion_position_usable) {
-        if (have_previous_fusion_position_) {
-            const float dx = static_cast<float>(
-                sample.fusion_x_mm - previous_fusion_x_mm_);
-            const float dy = static_cast<float>(
-                sample.fusion_y_mm - previous_fusion_y_mm_);
-            fusion_delta_mm = sqrtf(dx * dx + dy * dy);
-        }
-        previous_fusion_x_mm_ = sample.fusion_x_mm;
-        previous_fusion_y_mm_ = sample.fusion_y_mm;
-        have_previous_fusion_position_ = true;
-    } else {
-        have_previous_fusion_position_ = false;
-    }
-
-    const float encoder_delta_mm =
-        absolute(encoder_velocity) * dt_s;
-
-    const bool gps_reliable_for_stuck =
-        sample.gps_available &&
-        sample.gps_horizontal_accuracy_mm <=
-            config_.gps_maximum_accuracy_mm;
-
-    if (translation_commanded && gps_reliable_for_stuck) {
+    if (translation_dominant && gps_reliable) {
         last_gps_seen_ms_ = sample.timestamp_ms;
-        gps_expected_mm_ +=
-            absolute(sample.command_velocity_mm_s) * dt_s;
-        if (sample.encoder_available) gps_encoder_mm_ += encoder_delta_mm;
-        if (sample.gps_updated) {
-            if (!gps_window_active_) {
-                gps_window_active_ = true;
-                gps_window_started_ms_ = sample.timestamp_ms;
-                gps_start_x_mm_ = sample.gps_x_mm;
-                gps_start_y_mm_ = sample.gps_y_mm;
-                gps_max_radius_mm_ = 0.0f;
-                gps_expected_mm_ = 0.0f;
-                gps_encoder_mm_ = 0.0f;
-                gps_sample_count_ = 1;
-            } else {
+        if (!gps_window_active_ && sample.gps_updated) {
+            gps_window_active_ = true;
+            gps_window_started_ms_ = sample.timestamp_ms;
+            gps_start_x_mm_ = sample.gps_x_mm;
+            gps_start_y_mm_ = sample.gps_y_mm;
+            gps_sample_count_ = 1;
+        } else if (gps_window_active_) {
+            if (sample.encoder_available) gps_encoder_mm_ += encoder_delta_mm;
+            if (sample.gps_updated) {
                 const float dx = static_cast<float>(
                     sample.gps_x_mm - gps_start_x_mm_);
                 const float dy = static_cast<float>(
                     sample.gps_y_mm - gps_start_y_mm_);
                 const float radius = sqrtf(dx * dx + dy * dy);
-                if (radius > gps_max_radius_mm_) {
-                    gps_max_radius_mm_ = radius;
-                }
-                if (gps_sample_count_ < UINT8_MAX) gps_sample_count_++;
+                if (radius > gps_max_radius_mm_) gps_max_radius_mm_ = radius;
+                if (gps_sample_count_ < UINT8_MAX) ++gps_sample_count_;
             }
         }
-    } else if (!translation_commanded ||
-               (last_gps_seen_ms_ != 0 &&
+    } else if (!translation_dominant ||
+               (last_gps_seen_ms_ != 0U &&
                 static_cast<uint32_t>(
                     sample.timestamp_ms - last_gps_seen_ms_) > 3000U)) {
         resetGpsWindow();
     }
 
-    const float required_gps_expected_mm = fmaxf(
-        config_.gps_minimum_expected_mm,
-        4.0f * static_cast<float>(
-            sample.gps_horizontal_accuracy_mm));
-    const bool gps_stationary =
+    const float gps_stationary_radius_mm = fmaxf(
+        config_.gps_stationary_radius_mm,
+        0.75f * static_cast<float>(sample.gps_horizontal_accuracy_mm));
+    const float gps_moving_radius_mm = fmaxf(
+        1500.0f,
+        1.5f * static_cast<float>(sample.gps_horizontal_accuracy_mm));
+    const bool gps_window_ready =
         gps_window_active_ &&
         static_cast<uint32_t>(
             sample.timestamp_ms - gps_window_started_ms_) >=
             config_.gps_window_ms &&
         gps_sample_count_ >= config_.gps_minimum_samples &&
-        gps_expected_mm_ >= required_gps_expected_mm &&
-        gps_max_radius_mm_ <= config_.gps_stationary_radius_mm;
+        gps_encoder_mm_ >= config_.slip_minimum_encoder_mm;
+    const bool gps_stationary =
+        gps_window_ready && gps_max_radius_mm_ <= gps_stationary_radius_mm;
+    const bool gps_moving =
+        gps_window_active_ && gps_max_radius_mm_ >= gps_moving_radius_mm;
     if (gps_stationary) {
         assessment.evidence_flags |= EVIDENCE_GPS_NOT_MOVING;
-    } else if (gps_window_active_ &&
-               gps_max_radius_mm_ >
-                   config_.gps_stationary_radius_mm) {
+    } else if (gps_moving) {
         assessment.evidence_flags |= EVIDENCE_GPS_MOVING;
     }
 
-    if (sample.path_available && translation_commanded) {
-        if (!path_window_active_ ||
-            sample.path_revision != path_revision_) {
-            path_window_active_ = true;
-            path_window_started_ms_ = sample.timestamp_ms;
-            path_revision_ = sample.path_revision;
-            path_start_index_ = sample.path_nearest_index;
-            path_start_goal_distance_mm_ =
-                sample.path_distance_to_goal_mm;
-            path_commanded_mm_ = 0.0f;
-        } else {
-            path_commanded_mm_ +=
-                absolute(sample.command_velocity_mm_s) * dt_s;
-        }
-    } else {
-        resetPathWindow();
+    const bool wheel_slip_evidence =
+        armed && translation_dominant && left_moving && right_moving &&
+        gps_stationary;
+    const bool wheel_slip_healthy =
+        translation_dominant && left_moving && right_moving && gps_moving;
+
+    // Use bounded raw-GPS windows. A historical movement in an old window
+    // must not mask a later slip at the new location.
+    if (gps_window_ready && !gps_stationary) {
+        resetGpsWindow();
     }
 
-    if (sample.fusion_position_usable) {
-        if (!oscillation_window_active_) {
-            oscillation_window_active_ = true;
-            oscillation_window_started_ms_ = sample.timestamp_ms;
-            oscillation_start_x_mm_ = sample.fusion_x_mm;
-            oscillation_start_y_mm_ = sample.fusion_y_mm;
-            oscillation_max_radius_mm_ = 0.0f;
-            oscillation_motion_mm_ = 0.0f;
-            oscillation_reversals_ = 0;
-        }
-        const float dx = static_cast<float>(
-            sample.fusion_x_mm - oscillation_start_x_mm_);
-        const float dy = static_cast<float>(
-            sample.fusion_y_mm - oscillation_start_y_mm_);
-        const float radius = sqrtf(dx * dx + dy * dy);
-        if (radius > oscillation_max_radius_mm_) {
-            oscillation_max_radius_mm_ = radius;
-        }
-        oscillation_motion_mm_ +=
-            sample.encoder_available ? encoder_delta_mm : fusion_delta_mm;
-
-        const int8_t translation_sign = signWithDeadband(
-            sample.command_velocity_mm_s,
-            config_.minimum_translation_command_mm_s);
-        const int8_t rotation_sign = signWithDeadband(
-            sample.command_yaw_rate_rad_s,
-            config_.minimum_rotation_command_rad_s);
-        if ((translation_sign != 0 && previous_translation_sign_ != 0 &&
-             translation_sign != previous_translation_sign_) ||
-            (rotation_sign != 0 && previous_rotation_sign_ != 0 &&
-             rotation_sign != previous_rotation_sign_)) {
-            if (oscillation_reversals_ < UINT8_MAX) {
-                oscillation_reversals_++;
-            }
-        }
-        if (translation_sign != 0) {
-            previous_translation_sign_ = translation_sign;
-        }
-        if (rotation_sign != 0) {
-            previous_rotation_sign_ = rotation_sign;
-        }
-    } else {
-        resetOscillationWindow();
-    }
-
-    if (!armed) return assessment;
-
-    const float command_abs =
-        absolute(sample.command_velocity_mm_s);
-    const float stopped_translation_threshold =
-        fmaxf(config_.stopped_velocity_mm_s,
-              command_abs * config_.stopped_ratio);
-    const float moving_translation_threshold =
-        fmaxf(config_.stopped_velocity_mm_s,
-              command_abs * config_.moving_ratio);
-
-    const bool encoder_translation_stopped =
-        sample.encoder_available &&
-        absolute(encoder_velocity) < stopped_translation_threshold;
-    const bool fusion_translation_stopped =
-        fusion_translation_available &&
-        absolute(sample.fusion_forward_velocity_mm_s) <
-            stopped_translation_threshold;
-    const bool encoder_translation_moving =
-        sample.encoder_available &&
-        absolute(encoder_velocity) > moving_translation_threshold;
-    const bool fusion_translation_moving =
-        fusion_translation_available &&
-        absolute(sample.fusion_forward_velocity_mm_s) >
-            moving_translation_threshold;
-
-    // Fusion velocity contains encoder information. Count it as an
-    // independent source only when a trusted encoder is unavailable.
-    const bool independent_fusion_translation =
-        fusion_translation_available && !sample.encoder_available;
-    const uint8_t translation_available = countTrue(
-        sample.encoder_available,
-        independent_fusion_translation,
-        gps_stationary);
-    const uint8_t translation_stopped = countTrue(
-        encoder_translation_stopped,
-        fusion_translation_stopped && independent_fusion_translation,
-        gps_stationary);
-    const bool contradictory_translation =
-        encoder_translation_moving || fusion_translation_moving ||
-        (assessment.evidence_flags & EVIDENCE_GPS_MOVING) != 0U;
-    const bool translation_suspected =
-        translation_commanded &&
-        !contradictory_translation &&
-        translation_stopped >=
-            (translation_available >= 2U ? 2U : 1U);
-    const uint32_t translation_confirm_ms =
-        translation_available >= 2U
-            ? config_.blocked_confirm_ms
-            : config_.single_source_confirm_ms;
-
-    const float left_command =
-        sample.command_velocity_mm_s -
-        sample.command_yaw_rate_rad_s * config_.half_track_mm;
-    const float right_command =
-        sample.command_velocity_mm_s +
-        sample.command_yaw_rate_rad_s * config_.half_track_mm;
-    const bool left_commanded =
-        absolute(left_command) >= config_.minimum_wheel_command_mm_s;
-    const bool right_commanded =
-        absolute(right_command) >= config_.minimum_wheel_command_mm_s;
-    const bool left_stopped = sample.encoder_available && left_commanded &&
-        absolute(sample.encoder_left_velocity_mm_s) <
-            fmaxf(config_.stopped_velocity_mm_s,
-                  absolute(left_command) * config_.stopped_ratio);
-    const bool right_stopped = sample.encoder_available && right_commanded &&
-        absolute(sample.encoder_right_velocity_mm_s) <
-            fmaxf(config_.stopped_velocity_mm_s,
-                  absolute(right_command) * config_.stopped_ratio);
-    const bool left_moving = sample.encoder_available && left_commanded &&
-        absolute(sample.encoder_left_velocity_mm_s) >
-            absolute(left_command) * config_.moving_ratio;
-    const bool right_moving = sample.encoder_available && right_commanded &&
-        absolute(sample.encoder_right_velocity_mm_s) >
-            absolute(right_command) * config_.moving_ratio;
-
-    const bool encoder_rotation_stopped =
-        sample.encoder_available &&
-        absolute(encoder_yaw_rate) <
-            config_.stopped_yaw_rate_rad_s;
-    const bool gyro_rotation_stopped =
+    const bool gyro_stopped =
         sample.gyro_available &&
         absolute(sample.gyro_yaw_rate_rad_s) <
             config_.stopped_yaw_rate_rad_s;
-    const bool fusion_rotation_stopped =
-        fusion_rotation_available &&
-        absolute(sample.fusion_yaw_rate_rad_s) <
-            config_.stopped_yaw_rate_rad_s;
-    const float commanded_rotation_abs =
-        absolute(sample.command_yaw_rate_rad_s);
-    const float moving_rotation_threshold = fmaxf(
+    const float gyro_moving_threshold = fmaxf(
         config_.stopped_yaw_rate_rad_s,
-        commanded_rotation_abs * config_.moving_ratio);
-    const bool encoder_rotation_moving =
-        sample.encoder_available &&
-        absolute(encoder_yaw_rate) > moving_rotation_threshold;
-    const bool gyro_rotation_moving =
+        absolute(sample.command_yaw_rate_rad_s) * config_.moving_ratio);
+    const bool gyro_moving =
         sample.gyro_available &&
-        absolute(sample.gyro_yaw_rate_rad_s) >
-            moving_rotation_threshold;
-    const bool fusion_rotation_moving =
-        fusion_rotation_available &&
-        absolute(sample.fusion_yaw_rate_rad_s) >
-            moving_rotation_threshold;
-    const bool independent_fusion_rotation =
-        fusion_rotation_available &&
-        !sample.encoder_available &&
-        !sample.gyro_available;
-    const uint8_t rotation_available = countTrue(
-        sample.encoder_available,
-        sample.gyro_available,
-        independent_fusion_rotation);
-    const uint8_t rotation_stopped = countTrue(
-        encoder_rotation_stopped,
-        gyro_rotation_stopped,
-        fusion_rotation_stopped && independent_fusion_rotation);
-    const bool contradictory_rotation =
-        encoder_rotation_moving ||
-        gyro_rotation_moving ||
-        fusion_rotation_moving;
-    const bool rotation_suspected =
-        rotation_commanded &&
-        !contradictory_rotation &&
-        rotation_stopped >=
-            (rotation_available >= 2U ? 2U : 1U);
-
-    const bool slip_suspected =
-        translation_commanded &&
+        sample.gyro_yaw_rate_rad_s * sample.command_yaw_rate_rad_s > 0.0f &&
+        absolute(sample.gyro_yaw_rate_rad_s) >= gyro_moving_threshold;
+    const bool encoder_rotation_expected =
         sample.encoder_available &&
-        gps_stationary &&
-        gps_encoder_mm_ >= config_.slip_minimum_encoder_mm;
-
-    const bool path_window_ready =
-        path_window_active_ &&
-        static_cast<uint32_t>(
-            sample.timestamp_ms - path_window_started_ms_) >=
-            config_.path_window_ms &&
-        path_commanded_mm_ >= config_.path_minimum_commanded_mm;
-    const bool path_index_stalled =
-        sample.path_nearest_index <
-        static_cast<uint16_t>(
-            path_start_index_ + config_.path_minimum_index_advance);
-    const bool goal_not_improving =
-        path_start_goal_distance_mm_ -
-            sample.path_distance_to_goal_mm <
-        config_.path_minimum_goal_improvement_mm;
-    const bool path_suspected =
-        path_window_ready &&
-        path_index_stalled &&
-        goal_not_improving &&
-        (encoder_translation_moving || fusion_translation_moving);
-    if (path_suspected) {
-        assessment.evidence_flags |= EVIDENCE_PATH_NOT_PROGRESSING;
-    }
-
-    const bool oscillation_suspected =
-        oscillation_window_active_ &&
-        static_cast<uint32_t>(
-            sample.timestamp_ms - oscillation_window_started_ms_) >=
-            config_.oscillation_window_ms &&
-        oscillation_reversals_ >=
-            config_.oscillation_minimum_reversals &&
-        oscillation_motion_mm_ >=
-            config_.oscillation_minimum_motion_mm &&
-        oscillation_max_radius_mm_ <=
-            config_.oscillation_maximum_radius_mm;
-    if (oscillation_suspected) {
-        assessment.evidence_flags |= EVIDENCE_COMMAND_OSCILLATING;
-    }
-
-    if (gps_window_active_ && !gps_stationary &&
-        sample.gps_updated &&
-        static_cast<uint32_t>(
-            sample.timestamp_ms - gps_window_started_ms_) >=
-            config_.gps_window_ms) {
-        gps_window_started_ms_ = sample.timestamp_ms;
-        gps_start_x_mm_ = sample.gps_x_mm;
-        gps_start_y_mm_ = sample.gps_y_mm;
-        gps_max_radius_mm_ = 0.0f;
-        gps_expected_mm_ = 0.0f;
-        gps_encoder_mm_ = 0.0f;
-        gps_sample_count_ = 1;
-    }
-    if (path_window_ready && !path_suspected) {
-        resetPathWindow();
-    }
-    if (oscillation_window_active_ && !oscillation_suspected &&
-        static_cast<uint32_t>(
-            sample.timestamp_ms - oscillation_window_started_ms_) >=
-            config_.oscillation_window_ms) {
-        resetOscillationWindow();
-    }
-
-    Reason reason = Reason::None;
-    if (confirmCandidate(
-            Reason::LeftWheelBlocked,
-            left_stopped && right_moving,
-            config_.wheel_blocked_confirm_ms,
-            sample.timestamp_ms,
-            active_dt_ms)) {
-        reason = Reason::LeftWheelBlocked;
-    } else if (confirmCandidate(
-                   Reason::RightWheelBlocked,
-                   right_stopped && left_moving,
-                   config_.wheel_blocked_confirm_ms,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason = Reason::RightWheelBlocked;
-    } else if (confirmCandidate(
-                   Reason::RotationBlocked,
-                   rotation_suspected,
-                   rotation_available >= 2U
-                       ? config_.rotation_confirm_ms
-                       : config_.single_source_confirm_ms,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason = Reason::RotationBlocked;
-    } else if (confirmCandidate(
-                   Reason::WheelSlip,
-                   slip_suspected,
-                   config_.blocked_confirm_ms,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason = Reason::WheelSlip;
-    } else if (confirmCandidate(
-                   Reason::TranslationBlocked,
-                   translation_suspected,
-                   translation_confirm_ms,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason =
-            !sample.encoder_available && gps_stationary
-                ? Reason::GpsNoProgress
-                : Reason::TranslationBlocked;
-    } else if (confirmCandidate(
-                   Reason::Oscillation,
-                   oscillation_suspected,
-                   1000U,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason = Reason::Oscillation;
-    } else if (confirmCandidate(
-                   Reason::PathNoProgress,
-                   path_suspected,
-                   1000U,
-                   sample.timestamp_ms,
-                   active_dt_ms)) {
-        reason = Reason::PathNoProgress;
-    }
-
-    const bool translation_unobservable =
-        translation_commanded &&
-        !sample.encoder_available &&
-        !fusion_translation_available &&
-        !sample.gps_available;
-    const bool rotation_unobservable =
-        rotation_commanded &&
-        !sample.encoder_available &&
-        !fusion_rotation_available &&
-        !sample.gyro_available;
-    const bool motion_unobservable =
-        translation_unobservable || rotation_unobservable;
-    if (reason == Reason::None &&
-        confirmCandidate(
-            Reason::MotionUnobservable,
-            motion_unobservable,
-            config_.unobservable_confirm_ms,
-            sample.timestamp_ms,
-            active_dt_ms)) {
-        reason = Reason::MotionUnobservable;
-        assessment.condition = Condition::SensorFault;
-    }
-
-    if (reason != Reason::None) {
-        assessment.reason = reason;
-        assessment.suspected_since_ms =
-            candidate_since_ms_[reasonIndex(reason)];
-        if (assessment.condition != Condition::SensorFault) {
-            assessment.condition = Condition::Stuck;
+        encoder_yaw_rate * sample.command_yaw_rate_rad_s > 0.0f &&
+        absolute(encoder_yaw_rate) >= gyro_moving_threshold;
+    const float minimum_rotation_wheel_command =
+        config_.minimum_rotation_command_rad_s * config_.half_track_mm;
+    const bool rotation_left_stopped =
+        sample.encoder_available &&
+        absolute(left_command) >= minimum_rotation_wheel_command &&
+        absolute(sample.encoder_left_velocity_mm_s) <
+            left_stopped_threshold;
+    const bool rotation_right_stopped =
+        sample.encoder_available &&
+        absolute(right_command) >= minimum_rotation_wheel_command &&
+        absolute(sample.encoder_right_velocity_mm_s) <
+            right_stopped_threshold;
+    const bool rotation_blocked_evidence =
+        armed && rotation_dominant &&
+        ((rotation_left_stopped && rotation_right_stopped) ||
+         (encoder_rotation_expected && gyro_stopped));
+    const bool rotation_blocked_healthy = rotation_dominant && gyro_moving;
+    if (sample.gyro_available) {
+        assessment.evidence_flags |= gyro_stopped
+            ? EVIDENCE_GYRO_NOT_ROTATING
+            : EVIDENCE_GYRO_ROTATING;
+        if (encoder_rotation_expected && gyro_stopped) {
+            assessment.evidence_flags |= EVIDENCE_ENCODER_GYRO_MISMATCH;
         }
+    } else {
+        assessment.evidence_flags |= EVIDENCE_GYRO_UNAVAILABLE;
+    }
+
+    bool tilt_valid = false;
+    float tilt_deg = 0.0f;
+    if (sample.acceleration_available) {
+        const float norm = sqrtf(
+            sample.acceleration_x_g * sample.acceleration_x_g +
+            sample.acceleration_y_g * sample.acceleration_y_g +
+            sample.acceleration_z_g * sample.acceleration_z_g);
+        if (isfinite(norm) && norm >= 0.75f && norm <= 1.25f) {
+            if (!have_gravity_) {
+                gravity_body_g_[0] = sample.acceleration_x_g;
+                gravity_body_g_[1] = sample.acceleration_y_g;
+                gravity_body_g_[2] = sample.acceleration_z_g;
+                have_gravity_ = true;
+            } else {
+                const float alpha = config_.gravity_low_pass_alpha;
+                gravity_body_g_[0] +=
+                    alpha * (sample.acceleration_x_g - gravity_body_g_[0]);
+                gravity_body_g_[1] +=
+                    alpha * (sample.acceleration_y_g - gravity_body_g_[1]);
+                gravity_body_g_[2] +=
+                    alpha * (sample.acceleration_z_g - gravity_body_g_[2]);
+            }
+            const float gravity_norm = sqrtf(
+                gravity_body_g_[0] * gravity_body_g_[0] +
+                gravity_body_g_[1] * gravity_body_g_[1] +
+                gravity_body_g_[2] * gravity_body_g_[2]);
+            if (gravity_norm > 0.1f) {
+                float cosine = gravity_body_g_[2] / gravity_norm;
+                if (cosine > 1.0f) cosine = 1.0f;
+                if (cosine < -1.0f) cosine = -1.0f;
+                tilt_deg = radiansToDegrees(acosf(cosine));
+                tilt_valid = isfinite(tilt_deg);
+            }
+        }
+    }
+    current_tilt_deg_ = tilt_valid ? tilt_deg : 0.0f;
+
+    if (motion_commanded && tilt_valid &&
+        tilt_deg >= config_.body_tilt_start_deg) {
+        const uint32_t room = UINT32_MAX - body_tilt_active_ms_;
+        body_tilt_active_ms_ += dt_ms < room ? dt_ms : room;
+    } else {
+        body_tilt_active_ms_ = 0;
+    }
+    const bool body_trapped_evidence =
+        armed && motion_commanded && tilt_valid &&
+        body_tilt_active_ms_ >= config_.body_tilt_arm_ms;
+    const bool body_trapped_healthy =
+        tilt_valid && tilt_deg <= config_.body_tilt_healthy_deg;
+
+    updateScore(
+        scores_.wheel_blocked,
+        wheel_blocked_evidence,
+        wheel_blocked_healthy,
+        config_.wheel_blocked_rise_per_s,
+        dt_ms);
+    updateScore(
+        scores_.wheel_slip,
+        wheel_slip_evidence,
+        wheel_slip_healthy,
+        config_.wheel_slip_rise_per_s,
+        dt_ms);
+    updateScore(
+        scores_.rotation_blocked,
+        rotation_blocked_evidence,
+        rotation_blocked_healthy,
+        config_.rotation_blocked_rise_per_s,
+        dt_ms);
+    updateScore(
+        scores_.body_trapped,
+        body_trapped_evidence,
+        body_trapped_healthy,
+        config_.body_trapped_rise_per_s,
+        dt_ms);
+
+    assessment.scores = scores_;
+    if (suspend_latched_) {
+        assessment.condition = Condition::Suspected;
         return assessment;
     }
 
-    for (uint8_t i = 1; i < REASON_COUNT; ++i) {
-        if (candidate_since_ms_[i] != 0) {
-            assessment.condition = Condition::Suspected;
-            assessment.reason = static_cast<Reason>(i);
-            assessment.suspected_since_ms = candidate_since_ms_[i];
-            break;
+    Reason selected = Reason::None;
+    uint16_t selected_score = 0;
+    const Reason reasons[] = {
+        Reason::WheelBlocked,
+        Reason::WheelSlip,
+        Reason::RotationBlocked,
+        Reason::BodyTrapped
+    };
+    for (Reason reason : reasons) {
+        const uint16_t score = scoreForReason(reason);
+        if (score >= config_.suspend_score && score > selected_score) {
+            selected = reason;
+            selected_score = score;
         }
+    }
+
+    if (selected != Reason::None) {
+        assessment.condition = Condition::Suspected;
+        assessment.reason = selected;
+        assessment.suspend_requested = true;
+        suspend_latched_ = true;
     }
     return assessment;
 }

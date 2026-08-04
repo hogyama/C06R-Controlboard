@@ -27,22 +27,26 @@ bool validGeodeticCoordinate(
 } // namespace
 
 GpsToXY::GpsToXY(
-    int32_t origin_latitude_e7,
-    int32_t origin_longitude_e7)
+    int32_t reference_latitude_e7,
+    int32_t reference_longitude_e7,
+    int32_t reference_x_mm,
+    int32_t reference_y_mm)
     : valid_(validGeodeticCoordinate(
-          origin_latitude_e7,
-          origin_longitude_e7)),
-      origin_latitude_deg_(
-          static_cast<double>(origin_latitude_e7) * 1.0e-7),
-      origin_longitude_deg_(
-          static_cast<double>(origin_longitude_e7) * 1.0e-7),
+          reference_latitude_e7,
+          reference_longitude_e7)),
+      reference_latitude_deg_(
+          static_cast<double>(reference_latitude_e7) * 1.0e-7),
+      reference_longitude_deg_(
+          static_cast<double>(reference_longitude_e7) * 1.0e-7),
+      reference_x_mm_(reference_x_mm),
+      reference_y_mm_(reference_y_mm),
       metres_per_radian_latitude_(0.0),
       metres_per_radian_longitude_(0.0)
 {
     if (!valid_) return;
 
     const double latitude_rad =
-        origin_latitude_deg_ * DEG_TO_RAD;
+        reference_latitude_deg_ * DEG_TO_RAD;
     const double sine_latitude = sin(latitude_rad);
     const double w = sqrt(
         1.0 - WGS84_E2 * sine_latitude * sine_latitude);
@@ -85,11 +89,13 @@ bool GpsToXY::convert(
     const double longitude_deg =
         static_cast<double>(longitude_e7) * 1.0e-7;
     const double x =
-        (longitude_deg - origin_longitude_deg_) *
-        DEG_TO_RAD * metres_per_radian_longitude_ * 1000.0;
+        (longitude_deg - reference_longitude_deg_) *
+        DEG_TO_RAD * metres_per_radian_longitude_ * 1000.0 +
+        static_cast<double>(reference_x_mm_);
     const double y =
-        (latitude_deg - origin_latitude_deg_) *
-        DEG_TO_RAD * metres_per_radian_latitude_ * 1000.0;
+        (latitude_deg - reference_latitude_deg_) *
+        DEG_TO_RAD * metres_per_radian_latitude_ * 1000.0 +
+        static_cast<double>(reference_y_mm_);
     if (!isfinite(x) || !isfinite(y) ||
         x < static_cast<double>(INT32_MIN) ||
         x > static_cast<double>(INT32_MAX) ||

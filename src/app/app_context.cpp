@@ -15,8 +15,8 @@ SrvRasp rasp;
 
 // FlashヘッダにもGPSゴール座標を保存し、別地点の地図混入を防ぐ。
 SrvFlash flash(
-    FieldConfig::ORIGIN_LATITUDE_E7,
-    FieldConfig::ORIGIN_LONGITUDE_E7);
+    FieldConfig::GOAL_LATITUDE_E7,
+    FieldConfig::GOAL_LONGITUDE_E7);
 AStar::Work astar_work;
 AStar::GridPos grid_path[128];
 PurePursuit::Point pp_path[128];

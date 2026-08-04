@@ -88,6 +88,8 @@ bool gpsCourseYaw(
     const Domain::Fusion::GpsUpdate& gps,
     float& yaw_rad)
 {
+    if (!gps.velocity_valid) return false;
+
     const float east = static_cast<float>(gps.velocity_east_mm_s);
     const float north = static_cast<float>(gps.velocity_north_mm_s);
     const float speed = hypotf(east, north);
@@ -136,8 +138,10 @@ void taskCoordinate(void* pvParameters)
         FieldConfig::MAGNETIC_DECLINATION_RAD;
     Domain::Fusion::Filter filter(fusion_config);
     const Domain::Geodesy::GpsToXY gps_to_xy(
-        FieldConfig::ORIGIN_LATITUDE_E7,
-        FieldConfig::ORIGIN_LONGITUDE_E7);
+        FieldConfig::GOAL_LATITUDE_E7,
+        FieldConfig::GOAL_LONGITUDE_E7,
+        FieldConfig::GOAL_X_MM,
+        FieldConfig::GOAL_Y_MM);
 
     uint32_t last_imu_timestamp_ms = 0;
     uint32_t last_encoder_timestamp_ms = 0;
@@ -327,6 +331,7 @@ void taskCoordinate(void* pvParameters)
                 nav_pvt_observation.velocity_east_mm_s;
             gps_observation.speed_accuracy_mm_s =
                 nav_pvt_observation.speed_accuracy_mm_s;
+            gps_observation.velocity_valid = true;
             gps_observation.fix_type =
                 nav_pvt_observation.fix_type;
             gps_observation.fix_ok = true;
@@ -347,6 +352,7 @@ void taskCoordinate(void* pvParameters)
             gps_observation.velocity_north_mm_s = 0;
             gps_observation.velocity_east_mm_s = 0;
             gps_observation.speed_accuracy_mm_s = UINT32_MAX;
+            gps_observation.velocity_valid = false;
             gps_observation.fix_type = 2;
             gps_observation.fix_ok = true;
             const bool nmea_satellites_fresh =

@@ -6,7 +6,9 @@ namespace Domain::Motion {
 
 enum class Reason : uint8_t {
     None = 0,
-    TranslationBlocked,
+    WheelBlocked,
+    // Wire/log compatibility with older firmware.
+    TranslationBlocked = WheelBlocked,
     RotationBlocked,
     EncoderGpsMismatch,
     Flipped,
@@ -17,7 +19,23 @@ enum class Reason : uint8_t {
     WheelSlip,
     SensorFault,
     PathNoProgress,
-    Oscillation
+    Oscillation,
+    BodyTrapped
+};
+
+struct StuckScores {
+    uint16_t wheel_blocked;
+    uint16_t wheel_slip;
+    uint16_t rotation_blocked;
+    uint16_t body_trapped;
+};
+
+struct DetectorDiagnostics {
+    uint16_t tilt_deg_x10;
+    uint16_t gps_window_age_ms;
+    uint16_t gps_max_radius_mm;
+    uint16_t gps_encoder_distance_mm;
+    uint8_t gps_sample_count;
 };
 
 enum EvidenceFlag : uint32_t {
@@ -57,6 +75,8 @@ struct Assessment {
     bool encoder_trusted;
     bool gps_trusted;
     bool gyro_trusted;
+    StuckScores scores;
+    bool suspend_requested;
 };
 
 } // namespace Domain::Motion

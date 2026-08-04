@@ -48,6 +48,7 @@ Domain::Fusion::GpsUpdate gpsObservation(
     observation.y_mm = y_mm;
     observation.horizontal_accuracy_mm = horizontal_accuracy_mm;
     observation.speed_accuracy_mm_s = 500;
+    observation.velocity_valid = true;
     observation.fix_type = 3;
     observation.fix_ok = true;
     return observation;
@@ -56,36 +57,29 @@ Domain::Fusion::GpsUpdate gpsObservation(
 void testSouthWestFieldOrigin()
 {
     Domain::Geodesy::GpsToXY converter(
-        FieldConfig::ORIGIN_LATITUDE_E7,
-        FieldConfig::ORIGIN_LONGITUDE_E7);
-    int32_t origin_x_mm = 1;
-    int32_t origin_y_mm = 1;
-    expect(converter.valid(), "south-west WGS84 origin is valid");
-    expect(converter.convert(
-               FieldConfig::ORIGIN_LATITUDE_E7,
-               FieldConfig::ORIGIN_LONGITUDE_E7,
-               origin_x_mm,
-               origin_y_mm),
-           "Domain geodesy converts the field origin");
-    expect(origin_x_mm == 0 && origin_y_mm == 0,
-           "south-west coordinate converts to local zero");
+        FieldConfig::GOAL_LATITUDE_E7,
+        FieldConfig::GOAL_LONGITUDE_E7,
+        FieldConfig::GOAL_X_MM,
+        FieldConfig::GOAL_Y_MM);
+    expect(converter.valid(), "surveyed WGS84 goal reference is valid");
 
     int32_t goal_x_mm = 0;
     int32_t goal_y_mm = 0;
     expect(converter.convert(
-               356051630,
-               1396831115,
+               FieldConfig::GOAL_LATITUDE_E7,
+               FieldConfig::GOAL_LONGITUDE_E7,
                goal_x_mm,
                goal_y_mm),
            "Domain geodesy converts the surveyed goal");
-    expect(goal_x_mm > 0 && goal_y_mm > 0,
-           "surveyed point is north-east of the south-west origin");
+    expect(goal_x_mm == FieldConfig::GOAL_X_MM &&
+               goal_y_mm == FieldConfig::GOAL_Y_MM,
+           "surveyed goal converts exactly to the local field centre");
     expect(FieldConfig::SIZE_X_MM == 60000 &&
            FieldConfig::SIZE_Y_MM == 60000,
            "field dimensions are 60 m by 60 m");
     expect(!converter.convert(
                1000000000,
-               FieldConfig::ORIGIN_LONGITUDE_E7,
+               FieldConfig::GOAL_LONGITUDE_E7,
                goal_x_mm,
                goal_y_mm),
            "invalid latitude is rejected in Domain");
@@ -167,11 +161,18 @@ void testGpsCourseFeedsBackToYaw()
 {
     Domain::Fusion::Filter filter;
     filter.initialize(30000, 30000, 0.0f, false, 1000, 500);
+    Domain::Fusion::EncoderObservation encoder{};
+    encoder.timestamp_ms = 1000;
+    filter.updateEncoder(encoder);
     filter.beginCycle();
     filter.predict(stationaryImu(1100));
+    encoder.timestamp_ms = 1100;
+    encoder.left_mm = 100;
+    encoder.right_mm = 100;
+    filter.updateEncoder(encoder);
 
     Domain::Fusion::GpsUpdate northbound =
-        gpsObservation(1100, 30000, 30000, 500);
+        gpsObservation(1100, 30100, 30000, 500);
     northbound.velocity_north_mm_s = 1500;
     northbound.speed_accuracy_mm_s = 150;
     expect(filter.updateGps(northbound),
@@ -333,6 +334,83 @@ void testEncoderKeepsYawWhenGyroIsMissing()
            "encoder differential supports yaw during gyro loss");
 }
 
+void testNmeaResnapPreservesEncoderVelocity()
+{
+    Domain::Fusion::Filter filter;
+    filter.initialize(10000, 10000, 0.0f, true, 1000, 500);
+    Domain::Fusion::EncoderObservation encoder{};
+    encoder.timestamp_ms = 1000;
+    filter.updateEncoder(encoder);
+    encoder.timestamp_ms = 1100;
+    encoder.left_mm = 100;
+    encoder.right_mm = 100;
+    filter.beginCycle();
+    filter.updateEncoder(encoder);
+
+    for (uint32_t index = 1; index <= 3; ++index) {
+        Domain::Fusion::GpsUpdate nmea = gpsObservation(
+            1100 + index * 100,
+            20000 + static_cast<int32_t>(index),
+            20000,
+            3000);
+        nmea.velocity_valid = false;
+        nmea.velocity_east_mm_s = 0;
+        nmea.velocity_north_mm_s = 0;
+        nmea.speed_accuracy_mm_s = UINT32_MAX;
+        filter.beginCycle();
+        filter.predict(stationaryImu(nmea.timestamp_ms));
+        filter.updateGps(nmea);
+    }
+
+    const Domain::Fusion::Output output = filter.output(1400);
+    expect(output.forward_velocity_mm_s > 500.0f,
+           "NMEA resnap does not invent zero velocity");
+    expect(output.position_std_mm < 5000U,
+           "NMEA resnap leaves finite position covariance");
+}
+
+void testReverseGpsCourseDoesNotFlipYaw()
+{
+    Domain::Fusion::Filter filter;
+    filter.initialize(30000, 30000, 0.0f, true, 1000, 500);
+    Domain::Fusion::EncoderObservation encoder{};
+    encoder.timestamp_ms = 1000;
+    filter.updateEncoder(encoder);
+    filter.beginCycle();
+    filter.predict(stationaryImu(1100));
+    encoder.timestamp_ms = 1100;
+    encoder.left_mm = -100;
+    encoder.right_mm = -100;
+    filter.updateEncoder(encoder);
+
+    Domain::Fusion::GpsUpdate westbound =
+        gpsObservation(1100, 29900, 30000, 500);
+    westbound.velocity_east_mm_s = -1000;
+    westbound.speed_accuracy_mm_s = 150;
+    expect(filter.updateGps(westbound),
+           "reverse NAV-PVT speed is accepted");
+
+    const Domain::Fusion::Output output = filter.output(1100);
+    expect(std::abs(angleError(output.yaw_rad, 0.0f)) < 0.1f,
+           "reverse travel course is not used as vehicle yaw");
+}
+
+void testMissingEncoderInflatesPositionCovariance()
+{
+    Domain::Fusion::Filter filter;
+    filter.initialize(30000, 30000, 0.0f, true, 1000, 500);
+    for (uint32_t timestamp_ms = 1020;
+         timestamp_ms <= 11000;
+         timestamp_ms += 20) {
+        filter.beginCycle();
+        filter.predict(stationaryImu(timestamp_ms));
+    }
+
+    const Domain::Fusion::Output output = filter.output(11000);
+    expect(output.position_std_mm > 1000U,
+           "missing encoder increases position covariance with time");
+}
+
 void testStableGpsRecoveryResnapsAfterThreeSamples()
 {
     Domain::Fusion::Filter filter;
@@ -411,6 +489,9 @@ int main()
     testAccelerationIsNotIntegratedIntoPosition();
     testEncoderUpdatesPosition();
     testEncoderKeepsYawWhenGyroIsMissing();
+    testNmeaResnapPreservesEncoderVelocity();
+    testReverseGpsCourseDoesNotFlipYaw();
+    testMissingEncoderInflatesPositionCovariance();
     testStableGpsRecoveryResnapsAfterThreeSamples();
     testOutsideFieldGpsCanRecoverFusion();
     testLowAccuracyGpsCannotResnapFusion();

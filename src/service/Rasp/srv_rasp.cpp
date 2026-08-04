@@ -137,7 +137,7 @@ void SrvRasp::update()
 
     if (
         camera_ready &&
-        (!have_frame_ || camera_reception_started_) &&
+        camera_reception_started_ &&
         static_cast<uint32_t>(now - last_request_ms_) >=
             REQUEST_INTERVAL_MS
     ) {
@@ -229,7 +229,6 @@ bool SrvRasp::startCameraReception()
         !initialized_ ||
         !uart_active_ ||
         !power_enabled_ ||
-        !have_frame_ ||
         digitalRead(camera_ready_pin_) != HIGH
     ) {
         return false;
@@ -247,6 +246,18 @@ bool SrvRasp::startCameraReception()
     active_request_started_ms_ = millis();
     last_request_ms_ = active_request_started_ms_;
     return true;
+}
+
+void SrvRasp::stopCameraReception()
+{
+    if (!initialized_ || !power_enabled_) return;
+
+    digitalWrite(request_pin_, LOW);
+    waiting_response_ = false;
+    camera_reception_started_ = false;
+    active_request_started_ms_ = 0;
+    rx_size_ = 0;
+    if (uart_active_) uart_flush_input(uart_port_);
 }
 
 // Powers the Pi on and clears the previous communication session.
@@ -366,7 +377,7 @@ void SrvRasp::pollUart()
     }
 }
 
-// Decodes COBS and checks the 12-byte camera-result packet.
+// Decodes COBS and checks the 20-byte camera-result packet.
 bool SrvRasp::decodeAndValidate(
     const uint8_t* input,
     size_t length,

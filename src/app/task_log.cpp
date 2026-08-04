@@ -17,6 +17,7 @@ constexpr uint32_t MAGNETIC_TIMEOUT_MS = 250;
 constexpr uint32_t ENCODER_TIMEOUT_MS = 150;
 constexpr uint32_t GPS_TIMEOUT_MS = 2000;
 constexpr uint32_t CAMERA_TIMEOUT_MS = 2000;
+constexpr uint32_t STUCK_DIAGNOSTICS_TIMEOUT_MS = 300;
 
 enum ValidFlag : uint16_t {
     VALID_GPS = 1U << 0,
@@ -103,6 +104,7 @@ void taskLog(void* pvParameters)
         JogData jog{};
         Rasp::CameraData camera{};
         StuckStatus stuck{};
+        StuckDiagnostics stuck_diagnostics{};
         FlashStatus flash_status{};
 
         const bool has_coordinate = xQueuePeek(mbx_coordinate, &coordinate, 0) == pdTRUE;
@@ -130,6 +132,15 @@ void taskLog(void* pvParameters)
         const bool has_jog = xQueuePeek(mbx_can_jog_cmd, &jog, 0) == pdTRUE;
         const bool has_camera = xQueuePeek(mbx_camera_data, &camera, 0) == pdTRUE;
         const bool has_stuck = xQueuePeek(mbx_stuck_status, &stuck, 0) == pdTRUE;
+        const bool has_stuck_diagnostics =
+            xQueuePeek(
+                mbx_stuck_diagnostics,
+                &stuck_diagnostics,
+                0) == pdTRUE &&
+            isFresh(
+                now,
+                stuck_diagnostics.timestamp_ms,
+                STUCK_DIAGNOSTICS_TIMEOUT_MS);
         const bool has_flash = xQueuePeek(mbx_flash_status, &flash_status, 0) == pdTRUE;
 
         const bool nav_pvt_selected =
@@ -291,32 +302,57 @@ void taskLog(void* pvParameters)
                 : ageMs(
                     now,
                     coordinate.motion_anomaly_since_ms);
-        log.nmea_lat_1e7 =
-            has_nmea && nmea_observation.location_valid
-                ? nmea_observation.latitude_e7 : 0;
-        log.nmea_lng_1e7 =
-            has_nmea && nmea_observation.location_valid
-                ? nmea_observation.longitude_e7 : 0;
-        log.nmea_sentence_age_ms = has_nmea
-            ? ageMs(now, nmea_observation.sentence_timestamp_ms)
-            : UINT16_MAX;
-        log.nmea_location_age_ms = has_nmea
-            ? ageMs(now, nmea_observation.location_timestamp_ms)
-            : UINT16_MAX;
-        log.nmea_satellites_age_ms = has_nmea
-            ? ageMs(now, nmea_observation.satellites_timestamp_ms)
-            : UINT16_MAX;
-        log.nmea_hdop_x100 = nmea_observation.hdop_valid
-            ? nmea_observation.hdop_x100 : UINT16_MAX;
-        log.nmea_satellites = nmea_observation.satellites_valid
-            ? nmea_observation.satellites : 0;
-        log.nmea_flags = 0;
-        if (has_nmea) log.nmea_flags |= 1U << 0;
-        if (nmea_observation.location_valid) log.nmea_flags |= 1U << 1;
-        if (nmea_observation.satellites_valid) log.nmea_flags |= 1U << 2;
-        if (nmea_observation.hdop_valid) log.nmea_flags |= 1U << 3;
-        log.nav_pvt_receive_age_ms = has_gps
-            ? ageMs(now, gps_observation.received_ms) : UINT16_MAX;
+        if (has_stuck_diagnostics) {
+            log.stuck_score_wheel_blocked =
+                stuck_diagnostics.scores.wheel_blocked;
+            log.stuck_score_wheel_slip =
+                stuck_diagnostics.scores.wheel_slip;
+            log.stuck_score_rotation_blocked =
+                stuck_diagnostics.scores.rotation_blocked;
+            log.stuck_score_body_trapped =
+                stuck_diagnostics.scores.body_trapped;
+            log.stuck_verification_phase =
+                stuck_diagnostics.verification_phase;
+            log.stuck_trigger_reason = static_cast<uint8_t>(
+                stuck_diagnostics.trigger_reason);
+            const uint8_t reason_slot = [&]() -> uint8_t {
+                switch (stuck_diagnostics.trigger_reason) {
+                    case StuckReason::WheelBlocked: return 0;
+                    case StuckReason::WheelSlip: return 1;
+                    case StuckReason::RotationBlocked: return 2;
+                    case StuckReason::BodyTrapped: return 3;
+                    default: return UINT8_MAX;
+                }
+            }();
+            log.stuck_recurrence_count = reason_slot < 4U
+                ? stuck_diagnostics.recurrence_count[reason_slot]
+                : 0;
+            log.stuck_verification_result =
+                stuck_diagnostics.verification_result;
+            log.stuck_hash_distance_bits =
+                stuck_diagnostics.hash_distance_bits;
+            log.stuck_probe_left_delta_mm =
+                stuck_diagnostics.probe_left_delta_mm;
+            log.stuck_probe_right_delta_mm =
+                stuck_diagnostics.probe_right_delta_mm;
+            log.stuck_probe_gyro_angle_mrad =
+                stuck_diagnostics.probe_gyro_angle_mrad;
+            log.stuck_tilt_deg_x10 = stuck_diagnostics.tilt_deg_x10;
+            log.stuck_gps_max_radius_mm =
+                stuck_diagnostics.gps_max_radius_mm;
+            log.stuck_gps_encoder_distance_mm =
+                stuck_diagnostics.gps_encoder_distance_mm;
+            log.stuck_gps_sample_count =
+                stuck_diagnostics.gps_sample_count;
+            log.encoder_left_velocity_mm_s =
+                stuck_diagnostics.encoder_left_velocity_mm_s;
+            log.encoder_right_velocity_mm_s =
+                stuck_diagnostics.encoder_right_velocity_mm_s;
+            log.stuck_diagnostics_valid = 1;
+        } else {
+            log.stuck_hash_distance_bits = UINT8_MAX;
+        }
+        log.camera_scene_hash = camera_valid ? camera.frame.scene_hash : 0;
         xQueueOverwrite(mbx_flash_log, &log);
 
         telemetry_message_number++;
@@ -399,7 +435,7 @@ void taskLog(void* pvParameters)
                     log.motion_anomaly_age_ms / 100U > UINT8_MAX
                         ? UINT8_MAX
                         : log.motion_anomaly_age_ms / 100U);
-        } else {
+        } else if (telemetry.page == Twe::TelemetryPage::Gps) {
             auto& page = telemetry.data.gps;
             page.nmea_lat_1e7 =
                 has_nmea && nmea_observation.location_valid
@@ -450,6 +486,32 @@ void taskLog(void* pvParameters)
             if (has_gps && gps_observation.fix_ok) {
                 page.nav_pvt_flags |= 1U << 1;
             }
+        } else {
+            auto& page = telemetry.data.stuck;
+            page.score_wheel_blocked = log.stuck_score_wheel_blocked;
+            page.score_wheel_slip = log.stuck_score_wheel_slip;
+            page.score_rotation_blocked = log.stuck_score_rotation_blocked;
+            page.score_body_trapped = log.stuck_score_body_trapped;
+            page.verification_phase = log.stuck_verification_phase;
+            page.trigger_reason = log.stuck_trigger_reason;
+            page.recurrence_count = log.stuck_recurrence_count;
+            page.verification_result = log.stuck_verification_result;
+            page.hash_distance_bits = log.stuck_hash_distance_bits;
+            page.gps_sample_count = log.stuck_gps_sample_count;
+            page.diagnostics_valid = log.stuck_diagnostics_valid;
+            page.probe_left_delta_mm = log.stuck_probe_left_delta_mm;
+            page.probe_right_delta_mm = log.stuck_probe_right_delta_mm;
+            page.probe_gyro_angle_mrad =
+                log.stuck_probe_gyro_angle_mrad;
+            page.tilt_deg_x10 = log.stuck_tilt_deg_x10;
+            page.gps_max_radius_mm = log.stuck_gps_max_radius_mm;
+            page.gps_encoder_distance_mm =
+                log.stuck_gps_encoder_distance_mm;
+            page.encoder_left_velocity_mm_s =
+                log.encoder_left_velocity_mm_s;
+            page.encoder_right_velocity_mm_s =
+                log.encoder_right_velocity_mm_s;
+            page.camera_scene_hash = log.camera_scene_hash;
         }
         xQueueOverwrite(mbx_twe_telemetry, &telemetry);
     }

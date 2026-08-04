@@ -4,14 +4,10 @@
 
 namespace FieldConfig {
 
-// The previous GPS origin was the centre goal.  The south-west field corner
-// is 30 m south and 30 m west of that surveyed point.
-constexpr int32_t ORIGIN_LATITUDE_E7 = 356048841;
-constexpr int32_t ORIGIN_LONGITUDE_E7 = 1396820205;
-constexpr double ORIGIN_LATITUDE_DEG =
-    static_cast<double>(ORIGIN_LATITUDE_E7) * 1.0e-7;
-constexpr double ORIGIN_LONGITUDE_DEG =
-    static_cast<double>(ORIGIN_LONGITUDE_E7) * 1.0e-7;
+// The surveyed centre goal is the only configured GPS point. The local
+// origin is the south-west corner, 30 m south and 30 m west of the goal.
+constexpr int32_t GOAL_LATITUDE_E7 = 356048027;
+constexpr int32_t GOAL_LONGITUDE_E7 = 1396819493;
 
 constexpr int32_t SIZE_X_MM = 60000;
 constexpr int32_t SIZE_Y_MM = 60000;

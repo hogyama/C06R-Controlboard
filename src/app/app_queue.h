@@ -44,6 +44,7 @@ extern QueueHandle_t mbx_camera_data;
 // taskLogが作る最新Flashログと、taskStuckが作る最新判定結果
 extern QueueHandle_t mbx_flash_log;
 extern QueueHandle_t mbx_stuck_status;
+extern QueueHandle_t mbx_stuck_diagnostics;
 
 // Flash要求FIFO、要求元別の応答Mailbox、通常時を含むFlash状態共有
 extern QueueHandle_t fifo_flash_debug_request;

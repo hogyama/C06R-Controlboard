@@ -72,16 +72,29 @@ void taskRasp(void *pvParameters)
         }
 
         xQueuePeek(mbx_system_data, &system_data, 0);
+        StuckDiagnostics stuck_diagnostics{};
+        const uint32_t now = millis();
+        const bool wheel_slip_verification =
+            xQueuePeek(
+                mbx_stuck_diagnostics,
+                &stuck_diagnostics,
+                0) == pdTRUE &&
+            static_cast<uint32_t>(
+                now - stuck_diagnostics.timestamp_ms) <= 500U &&
+            stuck_diagnostics.trigger_reason == StuckReason::WheelSlip;
         const bool should_power_on =
             system_data.boot_mode != BootMode::DEBUG &&
             (system_data.state == SystemState::STATE_CAMERA_NAV ||
+             system_data.state == SystemState::STATE_STUCK_SUSPEND ||
              system_data.state == SystemState::STATE_ESCAPE ||
              system_data.state == SystemState::STATE_UPRIGHT_RECOVERY ||
              system_data.state == SystemState::STATE_GPS_NAV);
         const bool should_receive_camera =
             (system_data.boot_mode == BootMode::SEQUENCE ||
              system_data.boot_mode == BootMode::MANUAL) &&
-            system_data.state == SystemState::STATE_CAMERA_NAV;
+            (system_data.state == SystemState::STATE_CAMERA_NAV ||
+             (system_data.state == SystemState::STATE_STUCK_SUSPEND &&
+              wheel_slip_verification));
         // MANUAL is tuning/image mode; SEQUENCE is flight mode.
         const bool requested_image_mode =
             system_data.boot_mode == BootMode::MANUAL;
@@ -93,8 +106,11 @@ void taskRasp(void *pvParameters)
         }
 
         const SrvRasp::RaspStatus status = rasp.getStatus();
-        const uint32_t now = millis();
 
+        if (!should_receive_camera &&
+            (status.camera_reception_started || status.waiting_response)) {
+            rasp.stopCameraReception();
+        }
         // Leaving every Pi-using state clears a latched two-attempt failure.
         if (!should_power_on && !status.power_enabled) {
             power_cycle_failed = false;

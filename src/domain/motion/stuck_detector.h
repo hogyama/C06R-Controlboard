@@ -14,32 +14,31 @@ struct DetectorConfig {
     float stopped_velocity_mm_s = 60.0f;
     float stopped_yaw_rate_rad_s = 0.15f;
     float stopped_ratio = 0.20f;
-    float moving_ratio = 0.45f;
+    float moving_ratio = 0.55f;
 
     uint32_t command_arm_ms = 700;
     uint32_t command_gap_reset_ms = 800;
-    uint32_t blocked_confirm_ms = 3000;
-    uint32_t single_source_confirm_ms = 6000;
-    uint32_t wheel_blocked_confirm_ms = 2500;
-    uint32_t rotation_confirm_ms = 2500;
-    uint32_t unobservable_confirm_ms = 5000;
+    uint16_t score_maximum = 1000;
+    uint16_t suspend_score = 700;
+    uint16_t rearm_score = 200;
+    uint16_t wheel_blocked_rise_per_s = 150;
+    uint16_t wheel_slip_rise_per_s = 100;
+    uint16_t rotation_blocked_rise_per_s = 150;
+    uint16_t body_trapped_rise_per_s = 100;
+    uint16_t healthy_decay_per_s = 350;
+    uint16_t neutral_decay_per_s = 30;
 
-    uint32_t gps_window_ms = 10000;
+    uint32_t gps_window_ms = 8000;
     uint8_t gps_minimum_samples = 5;
     uint32_t gps_maximum_accuracy_mm = 2000;
-    float gps_minimum_expected_mm = 3000.0f;
     float gps_stationary_radius_mm = 1000.0f;
-    float slip_minimum_encoder_mm = 5000.0f;
+    float slip_minimum_encoder_mm = 3000.0f;
 
-    uint32_t path_window_ms = 15000;
-    float path_minimum_commanded_mm = 4000.0f;
-    float path_minimum_goal_improvement_mm = 700.0f;
-    uint16_t path_minimum_index_advance = 1;
+    float body_tilt_start_deg = 15.0f;
+    float body_tilt_healthy_deg = 10.0f;
+    uint32_t body_tilt_arm_ms = 2000;
+    float gravity_low_pass_alpha = 0.18f;
 
-    uint32_t oscillation_window_ms = 12000;
-    uint8_t oscillation_minimum_reversals = 4;
-    float oscillation_minimum_motion_mm = 4000.0f;
-    float oscillation_maximum_radius_mm = 2000.0f;
 };
 
 struct DetectorSample {
@@ -57,6 +56,11 @@ struct DetectorSample {
 
     bool gyro_available;
     float gyro_yaw_rate_rad_s;
+
+    bool acceleration_available;
+    float acceleration_x_g;
+    float acceleration_y_g;
+    float acceleration_z_g;
 
     bool fusion_available;
     bool fusion_position_usable;
@@ -85,13 +89,12 @@ public:
 
     void reset(uint32_t timestamp_ms = 0);
     Assessment update(const DetectorSample& sample);
+    void completeVerification(Reason reason, bool movement_confirmed);
+    StuckScores scores() const;
+    DetectorDiagnostics diagnostics(uint32_t timestamp_ms) const;
 
 private:
-    static constexpr uint8_t REASON_COUNT = 13;
-
     DetectorConfig config_;
-    uint32_t candidate_since_ms_[REASON_COUNT];
-    uint32_t candidate_active_ms_[REASON_COUNT];
     uint32_t command_active_ms_;
     uint32_t last_motion_command_ms_;
 
@@ -100,46 +103,26 @@ private:
     int32_t gps_start_x_mm_;
     int32_t gps_start_y_mm_;
     float gps_max_radius_mm_;
-    float gps_expected_mm_;
     float gps_encoder_mm_;
     uint8_t gps_sample_count_;
     bool gps_window_active_;
 
-    uint32_t path_window_started_ms_;
-    uint32_t path_revision_;
-    uint16_t path_start_index_;
-    float path_start_goal_distance_mm_;
-    float path_commanded_mm_;
-    bool path_window_active_;
-
-    uint32_t oscillation_window_started_ms_;
-    int32_t oscillation_start_x_mm_;
-    int32_t oscillation_start_y_mm_;
-    float oscillation_max_radius_mm_;
-    float oscillation_motion_mm_;
-    uint8_t oscillation_reversals_;
-    int8_t previous_translation_sign_;
-    int8_t previous_rotation_sign_;
-    bool oscillation_window_active_;
-
-    int32_t previous_fusion_x_mm_;
-    int32_t previous_fusion_y_mm_;
-    bool have_previous_fusion_position_;
+    StuckScores scores_;
+    uint32_t body_tilt_active_ms_;
+    float gravity_body_g_[3];
+    bool have_gravity_;
+    float current_tilt_deg_;
+    bool suspend_latched_;
 
     static float absolute(float value);
-    static int8_t signWithDeadband(float value, float deadband);
-    static uint8_t reasonIndex(Reason reason);
-
-    bool confirmCandidate(
-        Reason reason,
-        bool suspected,
-        uint32_t required_ms,
-        uint32_t now_ms,
-        uint32_t active_dt_ms);
-    void clearCandidates();
     void resetGpsWindow();
-    void resetPathWindow();
-    void resetOscillationWindow();
+    void updateScore(
+        uint16_t& score,
+        bool evidence,
+        bool healthy,
+        uint16_t rise_per_s,
+        uint32_t dt_ms);
+    uint16_t scoreForReason(Reason reason) const;
 };
 
 } // namespace Domain::Motion
