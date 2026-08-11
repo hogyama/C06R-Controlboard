@@ -18,7 +18,7 @@ void holdGpsPowerOff()
 } // namespace
 
 void taskGps(void *pvParameters) {
-    const TickType_t period = pdMS_TO_TICKS(100);
+    const TickType_t period = pdMS_TO_TICKS(10);
 
     // BootMode確定前はUARTを開始せず、GPSを確実に無給電状態へ置く。
     holdGpsPowerOff();
@@ -27,9 +27,7 @@ void taskGps(void *pvParameters) {
 
     // BootModeは起動時固定。DEBUGではgps.init()を一度も呼ばない。
     if (startup_status.boot_mode == BootMode::DEBUG) {
-        Gps::NmeaObservation nmea{};
         Gps::NavPvtObservation nav_pvt{};
-        xQueueOverwrite(mbx_gps_nmea_observation, &nmea);
         xQueueOverwrite(mbx_gps_nav_pvt_observation, &nav_pvt);
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -52,9 +50,7 @@ void taskGps(void *pvParameters) {
         xTaskDelayUntil(&last_wake, period);
 
         if(!gps_ready){
-            Gps::NmeaObservation nmea{};
             Gps::NavPvtObservation nav_pvt{};
-            xQueueOverwrite(mbx_gps_nmea_observation, &nmea);
             xQueueOverwrite(mbx_gps_nav_pvt_observation, &nav_pvt);
             continue;
         }
@@ -64,8 +60,10 @@ void taskGps(void *pvParameters) {
         switch(status.boot_mode)
         {
             case BootMode::SEQUENCE:
-                gps_should_power_on = (status.state != SystemState::STATE_GOAL) 
-                                    && (status.state != SystemState::STATE_PRELAUNCH);
+                // 衛星を事前捕捉し、航法開始時にFix待ちが発生しないようPRELAUNCHから給電する。
+                // ミッション終了後のGOALだけはGPSとUARTを停止する。
+                gps_should_power_on =
+                    status.state != SystemState::STATE_GOAL;
                 break;
             case BootMode::MANUAL:
                 // MANUALでは状態によらずGPSを動作させ、測位状態を常に確認できるようにする。
@@ -85,18 +83,12 @@ void taskGps(void *pvParameters) {
         }
         if(gps_power_on){
             gps.poll();
-            Gps::NmeaObservation nmea{};
-            if (gps.getNmeaObservation(&nmea)) {
-                xQueueOverwrite(mbx_gps_nmea_observation, &nmea);
-            }
             Gps::NavPvtObservation nav_pvt{};
             if (gps.getNavPvtObservation(&nav_pvt)) {
                 xQueueOverwrite(mbx_gps_nav_pvt_observation, &nav_pvt);
             }
         }else{
-            Gps::NmeaObservation nmea{};
             Gps::NavPvtObservation nav_pvt{};
-            xQueueOverwrite(mbx_gps_nmea_observation, &nmea);
             xQueueOverwrite(mbx_gps_nav_pvt_observation, &nav_pvt);
         }
     }

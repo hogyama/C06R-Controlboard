@@ -6,36 +6,33 @@ namespace Domain::Motion {
 
 enum class Reason : uint8_t {
     None = 0,
-    WheelBlocked,
-    // Wire/log compatibility with older firmware.
-    TranslationBlocked = WheelBlocked,
-    RotationBlocked,
-    EncoderGpsMismatch,
-    Flipped,
-    MotionUnobservable,
-    GpsNoProgress,
-    LeftWheelBlocked,
-    RightWheelBlocked,
-    WheelSlip,
-    SensorFault,
-    PathNoProgress,
-    Oscillation,
-    BodyTrapped
+    WheelBlocked = 1,
+    WheelSlip = 2,
+    RotationBlocked = 3
+};
+
+enum class FlipState : uint8_t {
+    Unknown = 0,
+    Upright,
+    HighTilt,
+    Flipped
 };
 
 struct StuckScores {
     uint16_t wheel_blocked;
     uint16_t wheel_slip;
     uint16_t rotation_blocked;
-    uint16_t body_trapped;
 };
 
 struct DetectorDiagnostics {
-    uint16_t tilt_deg_x10;
     uint16_t gps_window_age_ms;
-    uint16_t gps_max_radius_mm;
+    uint16_t gps_displacement_mm;
     uint16_t gps_encoder_distance_mm;
     uint8_t gps_sample_count;
+    uint8_t gps_speed_mismatch_count;
+    uint16_t wheel_blocked_active_ms;
+    uint16_t wheel_slip_active_ms;
+    uint16_t rotation_blocked_active_ms;
 };
 
 enum EvidenceFlag : uint32_t {
@@ -52,23 +49,18 @@ enum EvidenceFlag : uint32_t {
     EVIDENCE_ENCODER_UNAVAILABLE  = 1U << 9,
     EVIDENCE_GPS_UNAVAILABLE      = 1U << 10,
     EVIDENCE_GYRO_UNAVAILABLE     = 1U << 11,
-    EVIDENCE_FUSION_NOT_MOVING    = 1U << 12,
-    EVIDENCE_FUSION_MOVING        = 1U << 13,
-    EVIDENCE_FUSION_UNAVAILABLE   = 1U << 14,
-    EVIDENCE_PATH_NOT_PROGRESSING = 1U << 15,
-    EVIDENCE_COMMAND_OSCILLATING  = 1U << 16
+    EVIDENCE_GPS_SPEED_MISMATCH   = 1U << 12,
+    EVIDENCE_ACCELERATION_IMPACT  = 1U << 13,
+    EVIDENCE_DIRECTION_MISMATCH   = 1U << 14
 };
 
 enum class Condition : uint8_t {
     Normal = 0,
-    Suspected,
-    Stuck,
-    SensorFault
+    Suspected
 };
 
 struct Assessment {
     uint32_t timestamp_ms;
-    uint32_t suspected_since_ms;
     Condition condition;
     Reason reason;
     uint32_t evidence_flags;

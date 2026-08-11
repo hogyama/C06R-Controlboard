@@ -50,6 +50,12 @@ SystemCmdType convertTweCommand(Twe::Data command)
             return SystemCmdType::NotifyGoal;
         case Twe::CommandType::NotifySeparation:
             return SystemCmdType::NotifySeparation;
+        case Twe::CommandType::DisableGpsLocalization:
+            return SystemCmdType::DisableGpsLocalization;
+        case Twe::CommandType::EnableGpsLocalization:
+            return SystemCmdType::EnableGpsLocalization;
+        case Twe::CommandType::MarkObstacle:
+            return SystemCmdType::MarkObstacle;
         default:
             return SystemCmdType::None;
     }
@@ -78,7 +84,6 @@ void taskTwe(void *pvParameters) {
     }
 
     bool is_twe_power_on = false;
-    bool is_twe_should_power_on = false;
     uint32_t last_telemetry_ms = 0;
     TickType_t last_wake = xTaskGetTickCount();
     while (true){
@@ -88,34 +93,17 @@ void taskTwe(void *pvParameters) {
         }
         SystemData status = {};
         if(xQueuePeek(mbx_system_data, &status, 0) != pdTRUE) continue;
-        switch(status.boot_mode)
-        {
-            case BootMode::SEQUENCE:
-                // 待機上昇中と飛行中、ゴール後だけTWELITEを停止する。
-                is_twe_should_power_on =
-                    status.state != SystemState::STATE_GOAL &&
-                    status.state != SystemState::STATE_AWAIT_ASCENT &&
-                    status.state != SystemState::STATE_ASCENT_TO_LANDING;
-                if(is_twe_should_power_on && !is_twe_power_on){
-                    is_twe_power_on = twe.powerOn();
-                }else if(!is_twe_should_power_on && is_twe_power_on){
-                    twe.powerOff();
-                    is_twe_power_on = false;
-                }
-                break;
-            case BootMode::DEBUG:
-                is_twe_should_power_on = false;
-                if(is_twe_power_on){
-                    twe.powerOff();
-                    is_twe_power_on = false;
-                }
-                break;
-            case BootMode::MANUAL:
-                is_twe_should_power_on = true;
-                if(is_twe_should_power_on && !is_twe_power_on){
-                    is_twe_power_on = twe.powerOn();
-                }
-                break;
+        const bool should_power_on = status.boot_mode == BootMode::MANUAL ||
+            (status.boot_mode == BootMode::SEQUENCE &&
+             status.state != SystemState::STATE_GOAL &&
+             status.state != SystemState::STATE_AWAIT_ASCENT &&
+             status.state != SystemState::STATE_ASCENT_TO_LANDING);
+        if (should_power_on != is_twe_power_on) {
+            if (should_power_on) is_twe_power_on = twe.powerOn();
+            else {
+                twe.powerOff();
+                is_twe_power_on = false;
+            }
         }
         if(is_twe_power_on){
             twe.poll();

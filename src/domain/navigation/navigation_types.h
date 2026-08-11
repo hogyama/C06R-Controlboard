@@ -1,12 +1,12 @@
 #pragma once
 
 #include <stdint.h>
-#include "domain/fusion/fusion_types.h"
+#include "domain/localization/localization_types.h"
 
 namespace Domain::Navigation {
 
 struct Input {
-    Domain::Fusion::Output fusion;
+    Domain::Localization::LocalizationEstimate localization;
     int32_t goal_x_mm;
     int32_t goal_y_mm;
     uint32_t grid_map_update_count;

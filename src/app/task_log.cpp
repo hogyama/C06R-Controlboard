@@ -2,75 +2,158 @@
 #include "app_types.h"
 #include "app_queue.h"
 #include "app_context.h"
-#include "algorithm/astar.h"
-#include "domain/fusion/fusion_types.h"
-#include "platform/sensor_axis_transform.h"
+#include "domain/localization/localization_types.h"
+#include "domain/sensor/sensor_freshness.h"
 
+#include <esp_timer.h>
 #include <math.h>
 
 namespace {
 
-// Flash snapshotとTWELITE snapshotを全状態で10 Hzに統一する。
 constexpr uint32_t LOG_PERIOD_MS = 100;
 constexpr uint32_t IMU_TIMEOUT_MS = 100;
 constexpr uint32_t MAGNETIC_TIMEOUT_MS = 250;
+constexpr uint32_t PRESSURE_TIMEOUT_MS = 500;
 constexpr uint32_t ENCODER_TIMEOUT_MS = 150;
 constexpr uint32_t GPS_TIMEOUT_MS = 2000;
-constexpr uint32_t CAMERA_TIMEOUT_MS = 2000;
-constexpr uint32_t STUCK_DIAGNOSTICS_TIMEOUT_MS = 300;
+constexpr uint32_t COORDINATE_TIMEOUT_MS = 500;
+constexpr uint32_t CAMERA_TIMEOUT_MS = 500;
+constexpr uint32_t STUCK_TIMEOUT_MS = 300;
+constexpr float INVERSE_STANDARD_GRAVITY = 1.0f / 9.80665f;
 
 enum ValidFlag : uint16_t {
     VALID_GPS = 1U << 0,
-    VALID_IMU = 1U << 1,
-    VALID_MAGNETIC = 1U << 2,
-    VALID_ENCODER = 1U << 3,
-    VALID_COORDINATE = 1U << 4,
-    VALID_CAMERA = 1U << 5,
-    VALID_JOG = 1U << 6,
-    VALID_GPS_NMEA = 1U << 7,
-    VALID_GPS_NAV_PVT = 1U << 8
+    VALID_BOARD_IMU = 1U << 1,
+    VALID_CAN_IMU = 1U << 2,
+    VALID_BOARD_MAGNETIC = 1U << 3,
+    VALID_CAN_MAGNETIC = 1U << 4,
+    VALID_PRESSURE = 1U << 5,
+    VALID_ENCODER = 1U << 6,
+    VALID_COORDINATE = 1U << 7,
+    VALID_CAMERA = 1U << 8,
+    VALID_JOG = 1U << 9,
+    VALID_RASP_HEARTBEAT = 1U << 10,
+    GPS_LOCALIZATION_ENABLED = 1U << 11,
+    VALID_SELECTED_IMU = 1U << 12,
+    VALID_SELECTED_MAGNETIC = 1U << 13,
+    VALID_STUCK_DIAGNOSTICS = 1U << 14,
+    VALID_FLASH = 1U << 15,
 };
 
-bool isFresh(uint32_t now, uint32_t timestamp, uint32_t timeout)
+bool fresh(uint32_t now, uint32_t timestamp, uint32_t timeout)
 {
-    return timestamp != 0 && static_cast<uint32_t>(now - timestamp) <= timeout;
-}
-
-uint16_t ageMs(uint32_t now, uint32_t timestamp)
-{
-    if (timestamp == 0) return UINT16_MAX;
-    const uint32_t age = static_cast<uint32_t>(now - timestamp);
-    return age > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(age);
+    return timestamp != 0U && static_cast<uint32_t>(now - timestamp) <= timeout;
 }
 
 int16_t i16(float value)
 {
+    if (!isfinite(value)) return 0;
     if (value > 32767.0f) return 32767;
     if (value < -32768.0f) return -32768;
     return static_cast<int16_t>(lroundf(value));
 }
 
-uint16_t yawDeg1e2(float rad)
+uint16_t u16(uint32_t value)
 {
-    float angle = fmodf(rad, 2.0f * static_cast<float>(M_PI));
-    if (angle < 0.0f) angle += 2.0f * static_cast<float>(M_PI);
-    return static_cast<uint16_t>(lroundf(angle * 18000.0f / M_PI));
+    return value > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(value);
 }
 
-bool magneticYaw(const Can::Data::MagneticField& magnetic, float& yaw)
+uint16_t yawDeg1e2(float radians)
 {
-    const SensorAxisTransform::Vector3 body =
-        SensorAxisTransform::magneticToBody(
-            magnetic.x_uT, magnetic.y_uT, magnetic.z_uT);
-    const float horizontal = hypotf(body.x, body.y);
-    const float total = sqrtf(
-        body.x * body.x + body.y * body.y + body.z * body.z);
-    if (!isfinite(horizontal) || !isfinite(total) ||
-        horizontal < 5.0f || total < 10.0f || total > 100.0f) {
-        return false;
+    if (!isfinite(radians)) return 0;
+    float degrees = fmodf(radians * 180.0f / static_cast<float>(M_PI), 360.0f);
+    if (degrees < 0.0f) degrees += 360.0f;
+    return static_cast<uint16_t>(lroundf(degrees * 100.0f)) % 36000U;
+}
+
+uint8_t sensorSources(
+    Sensor::Source acceleration,
+    Sensor::Source gyroscope,
+    Sensor::Source magnetic,
+    Sensor::Source pressure)
+{
+    return (static_cast<uint8_t>(acceleration) & 0x03U) |
+        ((static_cast<uint8_t>(gyroscope) & 0x03U) << 2U) |
+        ((static_cast<uint8_t>(magnetic) & 0x03U) << 4U) |
+        ((static_cast<uint8_t>(pressure) & 0x03U) << 6U);
+}
+
+uint8_t flashState(bool available, const FlashStatus& status)
+{
+    if (!available) return 0;
+    uint8_t value = status.initialized ? 1U : 0U;
+    if (status.storage_full) value |= 1U << 1U;
+    if (status.last_event == FlashLedEvent::InitError ||
+        status.last_event == FlashLedEvent::WriteError) value |= 1U << 2U;
+    value |= static_cast<uint8_t>((status.used_file_flags & 0x07U) << 3U);
+    if (status.active_file_index >= 0 && status.active_file_index < 3) {
+        value |= static_cast<uint8_t>((status.active_file_index + 1) << 6U);
     }
-    yaw = static_cast<float>(M_PI_2) - atan2f(body.y, body.x);
-    return true;
+    return value;
+}
+
+void quantizeInertial(
+    const Sensor::AccelerometerData& acceleration,
+    bool acceleration_valid,
+    const Sensor::GyroscopeData& gyroscope,
+    bool gyroscope_valid,
+    int16_t output[6])
+{
+    if (acceleration_valid) {
+        output[0] = i16(acceleration.x_m_s2 * INVERSE_STANDARD_GRAVITY * 1000.0f);
+        output[1] = i16(acceleration.y_m_s2 * INVERSE_STANDARD_GRAVITY * 1000.0f);
+        output[2] = i16(acceleration.z_m_s2 * INVERSE_STANDARD_GRAVITY * 1000.0f);
+    }
+    if (gyroscope_valid) {
+        output[3] = i16(gyroscope.x_rad_s * 1000.0f);
+        output[4] = i16(gyroscope.y_rad_s * 1000.0f);
+        output[5] = i16(gyroscope.z_rad_s * 1000.0f);
+    }
+}
+
+void quantizeMagnetic(
+    const Sensor::MagneticData& input,
+    bool valid,
+    int16_t output[3])
+{
+    if (!valid) return;
+    output[0] = i16(input.x_uT * 10.0f);
+    output[1] = i16(input.y_uT * 10.0f);
+    output[2] = i16(input.z_uT * 10.0f);
+}
+
+int8_t i8(float value)
+{
+    if (!isfinite(value)) return 0;
+    if (value > 127.0f) return 127;
+    if (value < -128.0f) return -128;
+    return static_cast<int8_t>(lroundf(value));
+}
+
+void quantizeTweSensors(
+    const Sensor::AccelerometerData& acceleration,
+    bool acceleration_valid,
+    const Sensor::GyroscopeData& gyroscope,
+    bool gyroscope_valid,
+    const Sensor::MagneticData& magnetic,
+    bool magnetic_valid,
+    int8_t output[9])
+{
+    if (acceleration_valid) {
+        output[0] = i8(acceleration.x_m_s2 * INVERSE_STANDARD_GRAVITY * 20.0f);
+        output[1] = i8(acceleration.y_m_s2 * INVERSE_STANDARD_GRAVITY * 20.0f);
+        output[2] = i8(acceleration.z_m_s2 * INVERSE_STANDARD_GRAVITY * 20.0f);
+    }
+    if (gyroscope_valid) {
+        output[3] = i8(gyroscope.x_rad_s * 3.0f);
+        output[4] = i8(gyroscope.y_rad_s * 3.0f);
+        output[5] = i8(gyroscope.z_rad_s * 3.0f);
+    }
+    if (magnetic_valid) {
+        output[6] = i8(magnetic.x_uT / 16.0f);
+        output[7] = i8(magnetic.y_uT / 16.0f);
+        output[8] = i8(magnetic.z_uT / 16.0f);
+    }
 }
 
 } // namespace
@@ -78,28 +161,29 @@ bool magneticYaw(const Can::Data::MagneticField& magnetic, float& yaw)
 void taskLog(void* pvParameters)
 {
     (void)pvParameters;
-    uint32_t flash_message_number = 0;
-    uint16_t telemetry_message_number = 0;
-    uint8_t telemetry_page = 0;
+    uint32_t message_number = 0;
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
         xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LOG_PERIOD_MS));
         const uint32_t now = millis();
+        const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
 
         SystemData system{};
         if (xQueuePeek(mbx_system_data, &system, 0) != pdTRUE ||
-            system.boot_mode == BootMode::DEBUG) {
-            continue;
-        }
+            system.boot_mode == BootMode::DEBUG) continue;
 
         Coordinate coordinate{};
-        Gps::NmeaObservation nmea_observation{};
-        Gps::NavPvtObservation gps_observation{};
-        Domain::Fusion::GpsUpdate gps_local_observation{};
-        Can::Data::Sensor sensor{};
-        Can::Data::AngularVelocity angular{};
-        Can::Data::MagneticField magnetic{};
+        Gps::NavPvtObservation gps_data{};
+        Sensor::AccelerometerData acceleration{};
+        Sensor::AccelerometerData board_acceleration{};
+        Sensor::AccelerometerData can_acceleration{};
+        Sensor::GyroscopeData gyroscope{};
+        Sensor::GyroscopeData board_gyroscope{};
+        Sensor::GyroscopeData can_gyroscope{};
+        Sensor::MagneticData magnetic{}, board_magnetic{}, can_magnetic{};
+        Sensor::PressureData pressure{};
+        Sensor::AcquisitionStats acquisition_stats{};
         Can::Data::Encoder encoder{};
         JogData jog{};
         Rasp::CameraData camera{};
@@ -108,411 +192,268 @@ void taskLog(void* pvParameters)
         FlashStatus flash_status{};
 
         const bool has_coordinate = xQueuePeek(mbx_coordinate, &coordinate, 0) == pdTRUE;
-        const bool has_nmea =
+        const bool has_gps = xQueuePeek(mbx_gps_nav_pvt_observation, &gps_data, 0) == pdTRUE;
+        const bool has_acceleration =
+            xQueuePeek(mbx_acceleration, &acceleration, 0) == pdTRUE;
+        const bool has_board_acceleration = xQueuePeek(
+            mbx_board_acceleration, &board_acceleration, 0) == pdTRUE;
+        const bool has_can_acceleration = xQueuePeek(
+            mbx_can_acceleration, &can_acceleration, 0) == pdTRUE;
+        const bool has_gyroscope =
+            xQueuePeek(mbx_gyroscope, &gyroscope, 0) == pdTRUE;
+        const bool has_board_gyroscope = xQueuePeek(
+            mbx_board_gyroscope, &board_gyroscope, 0) == pdTRUE;
+        const bool has_can_gyroscope = xQueuePeek(
+            mbx_can_gyroscope, &can_gyroscope, 0) == pdTRUE;
+        const bool has_magnetic = xQueuePeek(mbx_magnetic, &magnetic, 0) == pdTRUE;
+        const bool has_board_magnetic =
+            xQueuePeek(mbx_board_magnetic, &board_magnetic, 0) == pdTRUE;
+        const bool has_can_magnetic =
+            xQueuePeek(mbx_can_magnetic, &can_magnetic, 0) == pdTRUE;
+        const bool has_pressure = xQueuePeek(mbx_pressure, &pressure, 0) == pdTRUE;
+        const bool has_acquisition_stats =
             xQueuePeek(
-                mbx_gps_nmea_observation,
-                &nmea_observation,
-                0) == pdTRUE &&
-            nmea_observation.sentence_timestamp_ms != 0;
-        const bool has_gps =
-            xQueuePeek(
-                mbx_gps_nav_pvt_observation,
-                &gps_observation,
-                0) == pdTRUE &&
-            gps_observation.received_ms != 0;
-        const bool has_local_gps =
-            xQueuePeek(
-                mbx_gps_local_observation,
-                &gps_local_observation,
+                mbx_sensor_acquisition_stats,
+                &acquisition_stats,
                 0) == pdTRUE;
-        const bool has_sensor = xQueuePeek(mbx_can_sensor, &sensor, 0) == pdTRUE;
-        const bool has_angular = xQueuePeek(mbx_can_angular_velocity, &angular, 0) == pdTRUE;
-        const bool has_magnetic = xQueuePeek(mbx_can_magnetic, &magnetic, 0) == pdTRUE;
         const bool has_encoder = xQueuePeek(mbx_can_encoder, &encoder, 0) == pdTRUE;
         const bool has_jog = xQueuePeek(mbx_can_jog_cmd, &jog, 0) == pdTRUE;
         const bool has_camera = xQueuePeek(mbx_camera_data, &camera, 0) == pdTRUE;
         const bool has_stuck = xQueuePeek(mbx_stuck_status, &stuck, 0) == pdTRUE;
         const bool has_stuck_diagnostics =
-            xQueuePeek(
-                mbx_stuck_diagnostics,
-                &stuck_diagnostics,
-                0) == pdTRUE &&
-            isFresh(
-                now,
-                stuck_diagnostics.timestamp_ms,
-                STUCK_DIAGNOSTICS_TIMEOUT_MS);
+            xQueuePeek(mbx_stuck_diagnostics, &stuck_diagnostics, 0) == pdTRUE;
         const bool has_flash = xQueuePeek(mbx_flash_status, &flash_status, 0) == pdTRUE;
 
-        const bool nav_pvt_selected =
-            has_gps &&
-            gps_observation.fix_ok &&
-            gps_observation.timestamp_ms ==
-                gps_local_observation.timestamp_ms;
-        const bool nmea_selected =
-            has_nmea &&
-            nmea_observation.location_valid &&
-            nmea_observation.location_timestamp_ms ==
-                gps_local_observation.timestamp_ms;
-        const bool gps_valid =
-            has_local_gps &&
-            gps_local_observation.fix_ok &&
-            (nav_pvt_selected || nmea_selected) &&
-            isFresh(
-                now,
-                gps_local_observation.timestamp_ms,
-                GPS_TIMEOUT_MS);
-        const bool imu_valid = has_sensor && has_angular &&
-            isFresh(now, sensor.ts_ms, IMU_TIMEOUT_MS) &&
-            isFresh(now, angular.ts_ms, IMU_TIMEOUT_MS);
-        const bool magnetic_fresh = has_magnetic &&
-            isFresh(now, magnetic.ts_ms, MAGNETIC_TIMEOUT_MS);
-        const bool encoder_valid = has_encoder &&
-            isFresh(now, encoder.ts_ms, ENCODER_TIMEOUT_MS);
-        const bool camera_valid = has_camera &&
-            isFresh(now, camera.received_ms, CAMERA_TIMEOUT_MS);
+        const bool gps_valid = has_gps && Sensor::sampleIsFresh(
+            gps_data.metadata, now_us, GPS_TIMEOUT_MS * 1000ULL);
+        const bool coordinate_valid = has_coordinate &&
+            fresh(now, coordinate.timestamp_ms, COORDINATE_TIMEOUT_MS) &&
+            (coordinate.localization_status_flags & Domain::Localization::STATUS_POSITION_USABLE) != 0U;
+        const bool acceleration_valid = has_acceleration && Sensor::sampleIsFresh(
+            acceleration.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool board_acceleration_valid = has_board_acceleration &&
+            Sensor::sampleIsFresh(
+                board_acceleration.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool can_acceleration_valid = has_can_acceleration &&
+            Sensor::sampleIsFresh(
+                can_acceleration.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool gyroscope_valid = has_gyroscope && Sensor::sampleIsFresh(
+            gyroscope.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool board_gyroscope_valid = has_board_gyroscope &&
+            Sensor::sampleIsFresh(
+                board_gyroscope.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool can_gyroscope_valid = has_can_gyroscope &&
+            Sensor::sampleIsFresh(
+                can_gyroscope.metadata, now_us, IMU_TIMEOUT_MS * 1000ULL);
+        const bool magnetic_valid = has_magnetic && Sensor::sampleIsFresh(
+            magnetic.metadata, now_us, MAGNETIC_TIMEOUT_MS * 1000ULL);
+        const bool board_magnetic_valid = has_board_magnetic &&
+            Sensor::sampleIsFresh(
+                board_magnetic.metadata, now_us, MAGNETIC_TIMEOUT_MS * 1000ULL);
+        const bool can_magnetic_valid = has_can_magnetic && Sensor::sampleIsFresh(
+            can_magnetic.metadata, now_us, MAGNETIC_TIMEOUT_MS * 1000ULL);
+        const bool pressure_valid = has_pressure && Sensor::sampleIsFresh(
+            pressure.metadata, now_us, PRESSURE_TIMEOUT_MS * 1000ULL);
+        const bool encoder_valid = has_encoder && Sensor::sampleIsFresh(
+            encoder.metadata, now_us, ENCODER_TIMEOUT_MS * 1000ULL);
+        const bool camera_valid =
+            has_camera && fresh(now, camera.received_ms, CAMERA_TIMEOUT_MS);
         const bool jog_valid = has_jog &&
             static_cast<uint32_t>(now - jog.timestamp_ms) < jog.duration_ms;
-        const bool coordinate_valid = has_coordinate &&
-            (coordinate.fusion_status_flags &
-             Domain::Fusion::STATUS_POSITION_USABLE) != 0U;
-
-        float magnetic_yaw = 0.0f;
-        const bool magnetic_valid =
-            magnetic_fresh && magneticYaw(magnetic, magnetic_yaw);
+        const bool stuck_diagnostics_valid = has_stuck_diagnostics &&
+            fresh(now, stuck_diagnostics.timestamp_ms, STUCK_TIMEOUT_MS);
+        const auto rasp_status = rasp.getStatus();
 
         uint16_t valid_flags = 0;
         if (gps_valid) valid_flags |= VALID_GPS;
-        if (gps_valid && nmea_selected) valid_flags |= VALID_GPS_NMEA;
-        if (gps_valid && nav_pvt_selected) valid_flags |= VALID_GPS_NAV_PVT;
-        if (imu_valid) valid_flags |= VALID_IMU;
-        if (magnetic_valid) valid_flags |= VALID_MAGNETIC;
+        if (board_acceleration_valid || board_gyroscope_valid) {
+            valid_flags |= VALID_BOARD_IMU;
+        }
+        if (can_acceleration_valid || can_gyroscope_valid) {
+            valid_flags |= VALID_CAN_IMU;
+        }
+        if (board_magnetic_valid) valid_flags |= VALID_BOARD_MAGNETIC;
+        if (can_magnetic_valid) valid_flags |= VALID_CAN_MAGNETIC;
+        if (pressure_valid) valid_flags |= VALID_PRESSURE;
         if (encoder_valid) valid_flags |= VALID_ENCODER;
         if (coordinate_valid) valid_flags |= VALID_COORDINATE;
         if (camera_valid) valid_flags |= VALID_CAMERA;
         if (jog_valid) valid_flags |= VALID_JOG;
-
-        uint16_t jog_remain = 0;
-        if (jog_valid) {
-            const uint32_t remain =
-                jog.duration_ms - static_cast<uint32_t>(now - jog.timestamp_ms);
-            jog_remain = remain > UINT16_MAX ? UINT16_MAX : remain;
+        if (rasp_status.heartbeat_alive) valid_flags |= VALID_RASP_HEARTBEAT;
+        if (system.gps_localization_enabled) {
+            valid_flags |= GPS_LOCALIZATION_ENABLED;
         }
-
-        AStar::GridPos cell{};
-        AStar::Config map_config{};
-        const bool cell_valid = AStar::worldToGridChecked(
-            static_cast<float>(coordinate.x_mm),
-            static_cast<float>(coordinate.y_mm), cell, map_config);
-
-        uint32_t map_update_count = 0;
-        if (xSemaphoreTake(mutex_grid_map, pdMS_TO_TICKS(5)) == pdTRUE) {
-            map_update_count = grid_map_update_count;
-            xSemaphoreGive(mutex_grid_map);
+        if (acceleration_valid || gyroscope_valid) {
+            valid_flags |= VALID_SELECTED_IMU;
         }
+        if (magnetic_valid) valid_flags |= VALID_SELECTED_MAGNETIC;
+        if (stuck_diagnostics_valid) valid_flags |= VALID_STUCK_DIAGNOSTICS;
+        if (has_flash && flash_status.initialized) valid_flags |= VALID_FLASH;
 
-        flash_message_number++;
-        if (flash_message_number == 0) flash_message_number = 1;
+        const uint8_t camera_flags =
+            (camera_valid ? 1U : 0U) |
+            (camera_valid && camera.frame.target_found ? 2U : 0U);
+        const uint8_t sources = sensorSources(
+            acceleration_valid ? acceleration.metadata.source : Sensor::Source::None,
+            gyroscope_valid ? gyroscope.metadata.source : Sensor::Source::None,
+            magnetic_valid ? magnetic.metadata.source : Sensor::Source::None,
+            pressure_valid ? pressure.metadata.source : Sensor::Source::None);
+        const uint8_t flash_state = flashState(has_flash, flash_status);
+        const uint8_t verification_result = stuck_diagnostics_valid
+            ? stuck_diagnostics.verification_result : 0U;
+        const uint8_t stuck_reason = has_stuck
+            ? static_cast<uint8_t>(stuck.reason) : 0U;
+        const uint16_t gps_hacc = gps_valid
+            ? u16(gps_data.horizontal_accuracy_mm) : UINT16_MAX;
+        const uint16_t pressure_div10 = pressure_valid && pressure.pressure_pa > 0
+            ? u16(static_cast<uint32_t>(pressure.pressure_pa) / 10U) : 0U;
 
+        int16_t board_imu_raw[6]{}, can_imu_raw[6]{};
+        int16_t board_magnetic_raw[3]{}, can_magnetic_raw[3]{};
+        quantizeInertial(
+            board_acceleration,
+            board_acceleration_valid,
+            board_gyroscope,
+            board_gyroscope_valid,
+            board_imu_raw);
+        quantizeInertial(
+            can_acceleration,
+            can_acceleration_valid,
+            can_gyroscope,
+            can_gyroscope_valid,
+            can_imu_raw);
+        quantizeMagnetic(board_magnetic, board_magnetic_valid, board_magnetic_raw);
+        quantizeMagnetic(can_magnetic, can_magnetic_valid, can_magnetic_raw);
+        int8_t board_twe_sensor[9]{}, can_twe_sensor[9]{};
+        quantizeTweSensors(
+            board_acceleration,
+            board_acceleration_valid,
+            board_gyroscope,
+            board_gyroscope_valid,
+            board_magnetic,
+            board_magnetic_valid,
+            board_twe_sensor);
+        quantizeTweSensors(
+            can_acceleration,
+            can_acceleration_valid,
+            can_gyroscope,
+            can_gyroscope_valid,
+            can_magnetic,
+            can_magnetic_valid,
+            can_twe_sensor);
+
+        if (++message_number == 0U) message_number = 1U;
         Flash::LogFrame log{};
         log.format_version = Flash::LOG_FORMAT_VERSION;
-        log.flash_file_index =
-            has_flash && flash_status.initialized ? flash_status.active_file_index : -1;
+        log.flash_file_index = has_flash ? flash_status.active_file_index : -1;
         log.mission_state = static_cast<uint8_t>(system.state);
         log.boot_mode = static_cast<uint8_t>(system.boot_mode);
-        log.message_number = flash_message_number;
+        log.message_number = message_number;
         log.timestamp_ms = now;
         log.valid_flags = valid_flags;
-        log.fusion_status_flags = coordinate.fusion_status_flags;
-        log.lat_1e7 = !gps_valid ? 0
-            : nav_pvt_selected ? gps_observation.latitude_e7
-            : nmea_observation.latitude_e7;
-        log.lng_1e7 = !gps_valid ? 0
-            : nav_pvt_selected ? gps_observation.longitude_e7
-            : nmea_observation.longitude_e7;
-        log.gps_x_mm =
-            gps_valid ? gps_local_observation.x_mm : 0;
-        log.gps_y_mm =
-            gps_valid ? gps_local_observation.y_mm : 0;
-        log.x_mm = coordinate.x_mm;
-        log.y_mm = coordinate.y_mm;
-        log.yaw_deg_1e2 = yawDeg1e2(coordinate.heading_rad);
-        log.forward_velocity_mm_s = i16(coordinate.forward_velocity_mm_s);
-        log.yaw_rate_rad_s_x1000 = i16(coordinate.yaw_rate_rad_s * 1000.0f);
-        log.position_std_mm = coordinate.position_std_mm;
-        log.yaw_std_mrad = i16(coordinate.yaw_std_rad * 1000.0f);
-        log.gps_fix_type = has_gps ? gps_observation.fix_type : 0;
-        log.gps_satellites = has_gps ? gps_observation.satellites : 0;
-        log.gps_horizontal_accuracy_mm =
-            has_gps ? gps_observation.horizontal_accuracy_mm : 0;
-        log.gps_velocity_east_mm_s =
-            has_gps ? gps_observation.velocity_east_mm_s : 0;
-        log.gps_velocity_north_mm_s =
-            has_gps ? gps_observation.velocity_north_mm_s : 0;
-        log.gps_speed_accuracy_mm_s =
-            has_gps ? gps_observation.speed_accuracy_mm_s : 0;
-        log.acc_x_mg = imu_valid ? i16(sensor.acc_x * 1000.0f) : 0;
-        log.acc_y_mg = imu_valid ? i16(sensor.acc_y * 1000.0f) : 0;
-        log.acc_z_mg = imu_valid ? i16(sensor.acc_z * 1000.0f) : 0;
-        log.gyro_z_rad_s_x1000 = imu_valid ? i16(angular.z_rad_s * 1000.0f) : 0;
-        log.magnetic_yaw_deg_1e2 = magnetic_valid ? yawDeg1e2(magnetic_yaw) : 0;
-        log.pressure_pa = has_sensor ? sensor.atm : 0;
-        log.encoder_left_mm = encoder_valid ? encoder.left_mm : 0;
-        log.encoder_right_mm = encoder_valid ? encoder.right_mm : 0;
-        log.imu_age_ms = has_sensor && has_angular
-            ? max(ageMs(now, sensor.ts_ms), ageMs(now, angular.ts_ms)) : UINT16_MAX;
-        log.magnetic_age_ms = has_magnetic ? ageMs(now, magnetic.ts_ms) : UINT16_MAX;
-        log.encoder_age_ms = has_encoder ? ageMs(now, encoder.ts_ms) : UINT16_MAX;
-        log.gps_age_ms = has_gps ? ageMs(now, gps_observation.timestamp_ms) : UINT16_MAX;
-        log.cell_x = cell_valid ? static_cast<int8_t>(cell.x) : -1;
-        log.cell_y = cell_valid ? static_cast<int8_t>(cell.y) : -1;
-        log.attitude = static_cast<uint8_t>(coordinate.attitude);
-        log.stuck_reason = has_stuck ? static_cast<uint8_t>(stuck.reason) : 0;
-        log.stuck_cell_x = has_stuck ? stuck.obstacle_cell_x : UINT8_MAX;
-        log.stuck_cell_y = has_stuck ? stuck.obstacle_cell_y : UINT8_MAX;
-        log.jog_velocity_mm_s = jog_valid ? i16(jog.velocity_mm_s) : 0;
-        log.jog_omega_rad_s_x100 = jog_valid ? i16(jog.omega_rad_s * 100.0f) : 0;
-        log.jog_remain_ms = jog_remain;
-        log.camera_valid = camera_valid;
-        log.camera_target_found = camera_valid ? camera.frame.target_found : 0;
-        log.camera_confidence = camera_valid ? camera.frame.confidence : 0;
-        log.camera_occupancy_permille =
-            camera_valid ? camera.frame.occupancy_permille : 0;
-        log.camera_angle_error_deg10 =
-            camera_valid ? camera.frame.angle_error_deg10 : 0;
+        log.localization_status_flags = has_coordinate
+            ? coordinate.localization_status_flags : 0U;
+        log.x_mm = has_coordinate ? coordinate.x_mm : 0;
+        log.y_mm = has_coordinate ? coordinate.y_mm : 0;
+        log.yaw_deg_1e2 = has_coordinate ? yawDeg1e2(coordinate.heading_rad) : 0U;
+        log.forward_velocity_mm_s =
+            has_coordinate ? i16(coordinate.forward_velocity_mm_s) : 0;
+        log.lat_1e7 = gps_valid ? gps_data.latitude_e7 : 0;
+        log.lng_1e7 = gps_valid ? gps_data.longitude_e7 : 0;
+        log.gps_fix_type = gps_valid ? gps_data.fix_type : 0U;
+        log.gps_satellites = gps_valid ? gps_data.satellites : 0U;
+        log.gps_horizontal_accuracy_mm = gps_hacc;
+        log.sensor_sources = sources;
+        log.camera_flags = camera_flags;
+        log.camera_angle_error_deg10 = camera_valid ? camera.frame.angle_error_deg10 : 0;
+        log.camera_occupancy_permille = camera_valid ? camera.frame.occupancy_permille : 0U;
+        log.camera_confidence = camera_valid ? camera.frame.confidence : 0U;
+        log.stuck_reason = stuck_reason;
+        log.stuck_verification_result = verification_result;
         log.rasp_state = static_cast<uint8_t>(rasp.getState());
         log.gps_state = static_cast<uint8_t>(gps.getStatus());
-        log.flash_used_flags = has_flash ? flash_status.used_file_flags : 0;
-        log.flash_storage_full = has_flash && flash_status.storage_full;
-        log.grid_map_update_count = map_update_count;
-        log.fusion_quality =
-            static_cast<uint8_t>(coordinate.fusion_quality);
-        log.gps_health =
-            static_cast<uint8_t>(coordinate.gps_health);
-        log.encoder_health =
-            static_cast<uint8_t>(coordinate.encoder_health);
-        log.imu_health =
-            static_cast<uint8_t>(coordinate.imu_health);
-        log.magnetic_health =
-            static_cast<uint8_t>(coordinate.magnetic_health);
-        log.motion_anomaly_flags =
-            coordinate.motion_anomaly_flags;
-        log.motion_anomaly_age_ms =
-            coordinate.motion_anomaly_since_ms == 0U
-                ? 0U
-                : ageMs(
-                    now,
-                    coordinate.motion_anomaly_since_ms);
-        if (has_stuck_diagnostics) {
-            log.stuck_score_wheel_blocked =
-                stuck_diagnostics.scores.wheel_blocked;
-            log.stuck_score_wheel_slip =
-                stuck_diagnostics.scores.wheel_slip;
-            log.stuck_score_rotation_blocked =
-                stuck_diagnostics.scores.rotation_blocked;
-            log.stuck_score_body_trapped =
-                stuck_diagnostics.scores.body_trapped;
-            log.stuck_verification_phase =
-                stuck_diagnostics.verification_phase;
-            log.stuck_trigger_reason = static_cast<uint8_t>(
-                stuck_diagnostics.trigger_reason);
-            const uint8_t reason_slot = [&]() -> uint8_t {
-                switch (stuck_diagnostics.trigger_reason) {
-                    case StuckReason::WheelBlocked: return 0;
-                    case StuckReason::WheelSlip: return 1;
-                    case StuckReason::RotationBlocked: return 2;
-                    case StuckReason::BodyTrapped: return 3;
-                    default: return UINT8_MAX;
-                }
-            }();
-            log.stuck_recurrence_count = reason_slot < 4U
-                ? stuck_diagnostics.recurrence_count[reason_slot]
-                : 0;
-            log.stuck_verification_result =
-                stuck_diagnostics.verification_result;
-            log.stuck_hash_distance_bits =
-                stuck_diagnostics.hash_distance_bits;
-            log.stuck_probe_left_delta_mm =
-                stuck_diagnostics.probe_left_delta_mm;
-            log.stuck_probe_right_delta_mm =
-                stuck_diagnostics.probe_right_delta_mm;
-            log.stuck_probe_gyro_angle_mrad =
-                stuck_diagnostics.probe_gyro_angle_mrad;
-            log.stuck_tilt_deg_x10 = stuck_diagnostics.tilt_deg_x10;
-            log.stuck_gps_max_radius_mm =
-                stuck_diagnostics.gps_max_radius_mm;
-            log.stuck_gps_encoder_distance_mm =
-                stuck_diagnostics.gps_encoder_distance_mm;
-            log.stuck_gps_sample_count =
-                stuck_diagnostics.gps_sample_count;
-            log.encoder_left_velocity_mm_s =
-                stuck_diagnostics.encoder_left_velocity_mm_s;
-            log.encoder_right_velocity_mm_s =
-                stuck_diagnostics.encoder_right_velocity_mm_s;
-            log.stuck_diagnostics_valid = 1;
-        } else {
-            log.stuck_hash_distance_bits = UINT8_MAX;
-        }
-        log.camera_scene_hash = camera_valid ? camera.frame.scene_hash : 0;
+        log.flash_state = flash_state;
+        log.board_acc_x_mg = board_imu_raw[0];
+        log.board_acc_y_mg = board_imu_raw[1];
+        log.board_acc_z_mg = board_imu_raw[2];
+        log.board_gyro_x_rad_s_x1000 = board_imu_raw[3];
+        log.board_gyro_y_rad_s_x1000 = board_imu_raw[4];
+        log.board_gyro_z_rad_s_x1000 = board_imu_raw[5];
+        log.can_acc_x_mg = can_imu_raw[0];
+        log.can_acc_y_mg = can_imu_raw[1];
+        log.can_acc_z_mg = can_imu_raw[2];
+        log.can_gyro_x_rad_s_x1000 = can_imu_raw[3];
+        log.can_gyro_y_rad_s_x1000 = can_imu_raw[4];
+        log.can_gyro_z_rad_s_x1000 = can_imu_raw[5];
+        log.board_magnetic_x_uT_x10 = board_magnetic_raw[0];
+        log.board_magnetic_y_uT_x10 = board_magnetic_raw[1];
+        log.board_magnetic_z_uT_x10 = board_magnetic_raw[2];
+        log.can_magnetic_x_uT_x10 = can_magnetic_raw[0];
+        log.can_magnetic_y_uT_x10 = can_magnetic_raw[1];
+        log.can_magnetic_z_uT_x10 = can_magnetic_raw[2];
+        log.pressure_pa_div10 = pressure_div10;
+        log.encoder_left_mm = encoder_valid ? encoder.left_mm : 0;
+        log.encoder_right_mm = encoder_valid ? encoder.right_mm : 0;
+        log.camera_scene_hash = camera_valid ? camera.frame.scene_hash : 0U;
+        log.gyro_samples_100ms = has_acquisition_stats
+            ? acquisition_stats.gyro_samples : 0U;
+        log.accel_samples_100ms = has_acquisition_stats
+            ? acquisition_stats.accel_samples : 0U;
+        log.magnetic_samples_100ms = has_acquisition_stats
+            ? acquisition_stats.magnetic_samples : 0U;
+        log.imu_fifo_overflow_count = has_acquisition_stats
+            ? acquisition_stats.fifo_overflow_count : 0U;
         xQueueOverwrite(mbx_flash_log, &log);
 
-        telemetry_message_number++;
-        if (telemetry_message_number == 0) telemetry_message_number = 1;
-        // TWELITEは1秒周期なので、全ページを毎秒順番に送る。
-        telemetry_page = static_cast<uint8_t>(
-            (now / 1000U) % static_cast<uint8_t>(Twe::TelemetryPage::Count));
         Twe::TelemetryFrame telemetry{};
         telemetry.protocol_version = Twe::TELEMETRY_PROTOCOL_VERSION;
-        telemetry.page = static_cast<Twe::TelemetryPage>(telemetry_page);
-        telemetry.message_number = telemetry_message_number;
+        telemetry.message_number = static_cast<uint16_t>(message_number);
+        if (telemetry.message_number == 0U) telemetry.message_number = 1U;
         telemetry.timestamp_ms = now;
         telemetry.mission_state = log.mission_state;
         telemetry.boot_mode = log.boot_mode;
         telemetry.valid_flags = valid_flags;
-
-        if (telemetry.page == Twe::TelemetryPage::Navigation) {
-            auto& page = telemetry.data.navigation;
-            page.lat_1e7 = log.lat_1e7;
-            page.lng_1e7 = log.lng_1e7;
-            page.gps_x_mm = log.gps_x_mm;
-            page.gps_y_mm = log.gps_y_mm;
-            page.x_mm = log.x_mm;
-            page.y_mm = log.y_mm;
-            page.yaw_deg_1e2 = log.yaw_deg_1e2;
-            page.forward_velocity_mm_s = log.forward_velocity_mm_s;
-            page.yaw_rate_rad_s_x1000 = log.yaw_rate_rad_s_x1000;
-            page.position_std_mm = log.position_std_mm;
-            page.yaw_std_mrad = log.yaw_std_mrad;
-            page.jog_velocity_mm_s = log.jog_velocity_mm_s;
-            page.jog_omega_rad_s_x100 = log.jog_omega_rad_s_x100;
-        } else if (telemetry.page == Twe::TelemetryPage::Sensors) {
-            auto& page = telemetry.data.sensors;
-            page.acc_x_mg = log.acc_x_mg;
-            page.acc_y_mg = log.acc_y_mg;
-            page.acc_z_mg = log.acc_z_mg;
-            page.pressure_pa = log.pressure_pa;
-            page.encoder_left_mm = log.encoder_left_mm;
-            page.encoder_right_mm = log.encoder_right_mm;
-            page.gyro_z_rad_s_x1000 = log.gyro_z_rad_s_x1000;
-            page.magnetic_yaw_deg_1e2 = log.magnetic_yaw_deg_1e2;
-            page.gps_fix_type = log.gps_fix_type;
-            page.gps_satellites = log.gps_satellites;
-            page.gps_horizontal_accuracy_mm = log.gps_horizontal_accuracy_mm;
-            page.gps_velocity_east_mm_s = log.gps_velocity_east_mm_s;
-            page.gps_velocity_north_mm_s = log.gps_velocity_north_mm_s;
-            page.gps_speed_accuracy_mm_s = log.gps_speed_accuracy_mm_s;
-        } else if (telemetry.page == Twe::TelemetryPage::Health) {
-            auto& page = telemetry.data.health;
-            page.flash_file_index = log.flash_file_index;
-            page.flash_used_flags = log.flash_used_flags;
-            page.flash_storage_full = log.flash_storage_full;
-            page.rasp_state = log.rasp_state;
-            page.gps_state = log.gps_state;
-            page.camera_valid = log.camera_valid;
-            page.camera_target_found = log.camera_target_found;
-            page.camera_confidence = log.camera_confidence;
-            page.camera_occupancy_permille = log.camera_occupancy_permille;
-            page.camera_angle_error_deg10 = log.camera_angle_error_deg10;
-            page.stuck_reason = log.stuck_reason;
-            page.stuck_cell_x = log.stuck_cell_x;
-            page.stuck_cell_y = log.stuck_cell_y;
-            page.attitude = log.attitude;
-            page.fusion_status_flags = log.fusion_status_flags;
-            page.imu_age_ms = log.imu_age_ms;
-            page.magnetic_age_ms = log.magnetic_age_ms;
-            page.encoder_age_ms = log.encoder_age_ms;
-            page.gps_age_ms = log.gps_age_ms;
-            page.jog_remain_ms = log.jog_remain_ms;
-            page.grid_map_update_count = log.grid_map_update_count;
-            page.fusion_quality = log.fusion_quality;
-            page.gps_health = log.gps_health;
-            page.encoder_health = log.encoder_health;
-            page.imu_health = log.imu_health;
-            page.magnetic_health = log.magnetic_health;
-            page.motion_anomaly_flags =
-                log.motion_anomaly_flags;
-            page.motion_anomaly_age_100ms =
-                static_cast<uint8_t>(
-                    log.motion_anomaly_age_ms / 100U > UINT8_MAX
-                        ? UINT8_MAX
-                        : log.motion_anomaly_age_ms / 100U);
-        } else if (telemetry.page == Twe::TelemetryPage::Gps) {
-            auto& page = telemetry.data.gps;
-            page.nmea_lat_1e7 =
-                has_nmea && nmea_observation.location_valid
-                    ? nmea_observation.latitude_e7 : 0;
-            page.nmea_lng_1e7 =
-                has_nmea && nmea_observation.location_valid
-                    ? nmea_observation.longitude_e7 : 0;
-            page.nmea_sentence_age_ms = has_nmea
-                ? ageMs(now, nmea_observation.sentence_timestamp_ms)
-                : UINT16_MAX;
-            page.nmea_location_age_ms = has_nmea
-                ? ageMs(now, nmea_observation.location_timestamp_ms)
-                : UINT16_MAX;
-            page.nmea_satellites_age_ms = has_nmea
-                ? ageMs(now, nmea_observation.satellites_timestamp_ms)
-                : UINT16_MAX;
-            page.nmea_hdop_x100 = nmea_observation.hdop_valid
-                ? nmea_observation.hdop_x100 : UINT16_MAX;
-            page.nmea_satellites = nmea_observation.satellites_valid
-                ? nmea_observation.satellites : 0;
-            page.nmea_flags = 0;
-            if (has_nmea) page.nmea_flags |= 1U << 0;
-            if (nmea_observation.location_valid) {
-                page.nmea_flags |= 1U << 1;
-            }
-            if (nmea_observation.satellites_valid) {
-                page.nmea_flags |= 1U << 2;
-            }
-            if (nmea_observation.hdop_valid) {
-                page.nmea_flags |= 1U << 3;
-            }
-            page.nav_pvt_lat_1e7 = has_gps
-                ? gps_observation.latitude_e7 : 0;
-            page.nav_pvt_lng_1e7 = has_gps
-                ? gps_observation.longitude_e7 : 0;
-            page.nav_pvt_hacc_mm = has_gps
-                ? gps_observation.horizontal_accuracy_mm : UINT32_MAX;
-            page.nav_pvt_measurement_age_ms = has_gps
-                ? ageMs(now, gps_observation.timestamp_ms) : UINT16_MAX;
-            page.nav_pvt_receive_age_ms = has_gps
-                ? ageMs(now, gps_observation.received_ms) : UINT16_MAX;
-            page.nav_pvt_fix_type = has_gps
-                ? gps_observation.fix_type : 0;
-            page.nav_pvt_satellites = has_gps
-                ? gps_observation.satellites : 0;
-            page.nav_pvt_flags = 0;
-            if (has_gps) page.nav_pvt_flags |= 1U << 0;
-            if (has_gps && gps_observation.fix_ok) {
-                page.nav_pvt_flags |= 1U << 1;
-            }
-        } else {
-            auto& page = telemetry.data.stuck;
-            page.score_wheel_blocked = log.stuck_score_wheel_blocked;
-            page.score_wheel_slip = log.stuck_score_wheel_slip;
-            page.score_rotation_blocked = log.stuck_score_rotation_blocked;
-            page.score_body_trapped = log.stuck_score_body_trapped;
-            page.verification_phase = log.stuck_verification_phase;
-            page.trigger_reason = log.stuck_trigger_reason;
-            page.recurrence_count = log.stuck_recurrence_count;
-            page.verification_result = log.stuck_verification_result;
-            page.hash_distance_bits = log.stuck_hash_distance_bits;
-            page.gps_sample_count = log.stuck_gps_sample_count;
-            page.diagnostics_valid = log.stuck_diagnostics_valid;
-            page.probe_left_delta_mm = log.stuck_probe_left_delta_mm;
-            page.probe_right_delta_mm = log.stuck_probe_right_delta_mm;
-            page.probe_gyro_angle_mrad =
-                log.stuck_probe_gyro_angle_mrad;
-            page.tilt_deg_x10 = log.stuck_tilt_deg_x10;
-            page.gps_max_radius_mm = log.stuck_gps_max_radius_mm;
-            page.gps_encoder_distance_mm =
-                log.stuck_gps_encoder_distance_mm;
-            page.encoder_left_velocity_mm_s =
-                log.encoder_left_velocity_mm_s;
-            page.encoder_right_velocity_mm_s =
-                log.encoder_right_velocity_mm_s;
-            page.camera_scene_hash = log.camera_scene_hash;
-        }
+        telemetry.localization_status_flags = log.localization_status_flags;
+        telemetry.x_mm = log.x_mm;
+        telemetry.y_mm = log.y_mm;
+        telemetry.yaw_deg_1e2 = log.yaw_deg_1e2;
+        telemetry.forward_velocity_mm_s = log.forward_velocity_mm_s;
+        telemetry.lat_1e7 = log.lat_1e7;
+        telemetry.lng_1e7 = log.lng_1e7;
+        telemetry.gps_fix_type = log.gps_fix_type;
+        telemetry.gps_satellites = log.gps_satellites;
+        telemetry.gps_horizontal_accuracy_mm = gps_hacc;
+        telemetry.sensor_sources = sources;
+        telemetry.camera_flags = camera_flags;
+        telemetry.camera_angle_error_deg10 = log.camera_angle_error_deg10;
+        telemetry.camera_occupancy_permille = log.camera_occupancy_permille;
+        telemetry.camera_confidence = log.camera_confidence;
+        telemetry.stuck_reason = stuck_reason;
+        telemetry.stuck_verification_result = verification_result;
+        telemetry.rasp_state = log.rasp_state;
+        telemetry.gps_state = log.gps_state;
+        telemetry.flash_state = flash_state;
+        telemetry.board_acc_x_g_x20 = board_twe_sensor[0];
+        telemetry.board_acc_y_g_x20 = board_twe_sensor[1];
+        telemetry.board_acc_z_g_x20 = board_twe_sensor[2];
+        telemetry.board_gyro_x_rad_s_x3 = board_twe_sensor[3];
+        telemetry.board_gyro_y_rad_s_x3 = board_twe_sensor[4];
+        telemetry.board_gyro_z_rad_s_x3 = board_twe_sensor[5];
+        telemetry.board_magnetic_x_uT_div16 = board_twe_sensor[6];
+        telemetry.board_magnetic_y_uT_div16 = board_twe_sensor[7];
+        telemetry.board_magnetic_z_uT_div16 = board_twe_sensor[8];
+        telemetry.can_acc_x_g_x20 = can_twe_sensor[0];
+        telemetry.can_acc_y_g_x20 = can_twe_sensor[1];
+        telemetry.can_acc_z_g_x20 = can_twe_sensor[2];
+        telemetry.can_gyro_x_rad_s_x3 = can_twe_sensor[3];
+        telemetry.can_gyro_y_rad_s_x3 = can_twe_sensor[4];
+        telemetry.can_gyro_z_rad_s_x3 = can_twe_sensor[5];
+        telemetry.can_magnetic_x_uT_div16 = can_twe_sensor[6];
+        telemetry.can_magnetic_y_uT_div16 = can_twe_sensor[7];
+        telemetry.can_magnetic_z_uT_div16 = can_twe_sensor[8];
+        telemetry.pressure_pa_div10 = pressure_div10;
+        telemetry.encoder_left_mm = log.encoder_left_mm;
+        telemetry.encoder_right_mm = log.encoder_right_mm;
         xQueueOverwrite(mbx_twe_telemetry, &telemetry);
     }
 }

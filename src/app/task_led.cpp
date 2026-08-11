@@ -8,6 +8,9 @@
 namespace {
 
 constexpr uint32_t LED_TASK_PERIOD_MS = 50;
+constexpr uint32_t LOG_ACTIVITY_TIMEOUT_MS = 300;
+constexpr uint32_t LOG_ACTIVITY_PERIOD_MS = 1000;
+constexpr uint32_t LOG_ACTIVITY_ON_MS = 150;
 
 /*
  * LED表示一覧
@@ -24,7 +27,7 @@ constexpr uint32_t LED_TASK_PERIOD_MS = 50;
  * - GOAL               : 常時点灯
  *
  * LED_MAP（Flash保存状態）
- * - LOG保存成功        : 80msを1回点灯
+ * - LOG正常保存中      : 1秒ごとに150ms点灯
  * - MAP保存成功        : 100msを2回点灯
  * - 書き込み失敗       : 100msを3回点灯（一時的な故障表示）
  * - 現在のLOGファイル満杯: 500ms点灯、500ms消灯（故障ではなく保存停止状態）
@@ -104,7 +107,9 @@ bool mapLedOn(const FlashStatus& flash_status, uint32_t now_ms)
         now_ms - flash_status.event_timestamp_ms);
     switch (flash_status.last_event) {
         case FlashLedEvent::LogSaved:
-            return age_ms < 80U;
+            // 100 msごとの保存を直接点滅させず、正常保存中を1 Hzで表示する。
+            return age_ms < LOG_ACTIVITY_TIMEOUT_MS &&
+                (now_ms % LOG_ACTIVITY_PERIOD_MS) < LOG_ACTIVITY_ON_MS;
 
         case FlashLedEvent::MapSaved:
             return isPulseOn(age_ms, 0, 100) ||
@@ -123,6 +128,19 @@ bool mapLedOn(const FlashStatus& flash_status, uint32_t now_ms)
     return false;
 }
 
+bool bootLedOn(BootMode mode, uint32_t now_ms)
+{
+    switch (mode) {
+        case BootMode::SEQUENCE: return true;
+        case BootMode::MANUAL: {
+            const uint32_t phase = now_ms % 1000U;
+            return isPulseOn(phase, 0, 120) || isPulseOn(phase, 240, 120);
+        }
+        case BootMode::DEBUG: return (now_ms % 200U) < 100U;
+    }
+    return false;
+}
+
 } // namespace
 
 void taskLed(void *pvParameters)
@@ -130,9 +148,13 @@ void taskLed(void *pvParameters)
     (void)pvParameters;
 
     pinMode(LED_STATE, OUTPUT);
-    pinMode(LED_MAP, OUTPUT);
+    pinMode(LED_FLASH, OUTPUT);
+    pinMode(LED_BOOT, OUTPUT);
+    pinMode(LED_ERROR, OUTPUT);
     digitalWrite(LED_STATE, LOW);
-    digitalWrite(LED_MAP, LOW);
+    digitalWrite(LED_FLASH, LOW);
+    digitalWrite(LED_BOOT, LOW);
+    digitalWrite(LED_ERROR, LOW);
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(LED_TASK_PERIOD_MS);
@@ -148,20 +170,28 @@ void taskLed(void *pvParameters)
             xQueuePeek(mbx_flash_status, &flash_status, 0) == pdTRUE;
 
         // DEBUGではSerialだけを使うため、両方のLEDを必ず消灯する。
+        const uint32_t now_ms = millis();
+        digitalWrite(LED_BOOT,
+            has_system && bootLedOn(system_data.boot_mode, now_ms) ? HIGH : LOW);
+        digitalWrite(LED_ERROR,
+            has_flash && (!flash_status.initialized ||
+                flash_status.last_event == FlashLedEvent::InitError ||
+                flash_status.last_event == FlashLedEvent::WriteError)
+                ? HIGH : LOW);
+
         const bool debug_mode = has_system &&
             system_data.boot_mode == BootMode::DEBUG;
         if (debug_mode) {
             digitalWrite(LED_STATE, LOW);
-            digitalWrite(LED_MAP, LOW);
+            digitalWrite(LED_FLASH, LOW);
             continue;
         }
 
-        const uint32_t now_ms = millis();
         digitalWrite(
             LED_STATE,
             has_system && stateLedOn(system_data.state, now_ms) ? HIGH : LOW);
         digitalWrite(
-            LED_MAP,
+            LED_FLASH,
             has_flash && mapLedOn(flash_status, now_ms) ? HIGH : LOW);
     }
 }

@@ -10,15 +10,31 @@ in the development cycle.
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
 
-Fusion host test:
+Localization host test:
 
-    g++ -std=c++17 -Isrc test/fusion_filter_test.cpp \
-        src/domain/fusion/fusion_filter.cpp \
-        src/domain/geodesy/gps_to_xy.cpp -o .pio/fusion_filter_test.exe
-    .pio/fusion_filter_test.exe
+    g++ -std=c++17 -Isrc test/localization_ekf_test.cpp \
+        src/domain/localization/localization_ekf.cpp \
+        src/domain/localization/localization_preprocessor.cpp \
+        src/domain/localization/localization.cpp \
+        -o .pio/localization_ekf_test.exe
+    .pio/localization_ekf_test.exe
 
-The test covers the south-west field origin, stationary propagation, the
-east-zero/counter-clockwise yaw convention, quaternion yaw integration,
-delayed GPS projection and course feedback, GPS and magnetic outlier
-rejection, encoder physical gating, sensor health hysteresis, long IMU gaps,
-and position/yaw usability expiry.
+The test covers signed forward/reverse velocity, the east-zero and
+counter-clockwise yaw convention, the pi boundary, gyro-bias convergence,
+GPS and magnetic outlier rejection, delayed-GNSS replay, and covariance
+symmetry/positivity.
+
+Stack and flip detector host tests:
+
+    g++ -std=c++17 -Isrc test/stuck_detector_test.cpp \
+        src/domain/motion/stuck_detector.cpp \
+        -o .pio/stuck_detector_test.exe
+    .pio/stuck_detector_test.exe
+
+    g++ -std=c++17 -Isrc test/flip_detector_test.cpp \
+        src/domain/motion/flip_detector.cpp \
+        -o .pio/flip_detector_test.exe
+    .pio/flip_detector_test.exe
+
+These tests cover wheel blocking, reverse rotation, slip evidence from GNSS,
+gyro and fallback timing, and the 500 ms source-aware flip confirmation.

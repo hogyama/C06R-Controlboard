@@ -58,8 +58,10 @@ void setup()
      */
     createTaskChecked(taskState,      "State",      4096, 5, 1);
     createTaskChecked(taskCan,        "CAN",        6144, 4, 1);
-    // 13-state ESKF uses Joseph covariance updates with temporary matrices.
-    createTaskChecked(taskCoordinate, "Coordinate", 10240, 4, 1);
+    createTaskChecked(taskSensor,     "Sensor",     6144, 4, 1);
+    // 5-state Localization EKF. Gyro integration and delayed-GNSS replay use
+    // fixed-size buffers and Joseph covariance updates.
+    createTaskChecked(taskLocalization, "Localization", 12288, 4, 1);
     createTaskChecked(taskMotionArbiter, "MotionArb", 4096, 4, 1);
     createTaskChecked(taskNav,        "Nav",       12288, 3, 1);
     createTaskChecked(taskStuck,      "Stuck",      6144, 3, 1);

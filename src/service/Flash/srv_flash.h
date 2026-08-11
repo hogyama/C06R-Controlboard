@@ -8,10 +8,10 @@
 
 // 1回のMAPは2048B = 2KB(64x64マップ、1セル4bit)
 // MAP保存領域のセクタは header 256B x3 + MAP 1024B x3 + padding 256B = 4096B = 4KBとする
-// 1回のログは256B
+// 1回のログは128B
 
 // MAP保存領域は128KB = 4KB * 32セクタより、96回のMAPを保存可能
-// FILEは5120KB = 1280 * 4KB = 5MBより、20480個のログを保存可能
+// FILEは5120KB = 1280 * 4KB = 5MBより、40960個のログを保存可能
 
 // MAP保存領域 x 2 + FILE保存領域 x 3として運用する
 
@@ -60,8 +60,8 @@
 #define FILES_END_ADDRESS 0xF3FFFF
 
 #define FILE_SIZE 0x500000      // FILEのサイズ（5MB）
-#define LOG_RECORD_SIZE 256     // 1回のログのサイズ
-#define MAX_LOGS_PER_FILE (FILE_SIZE / LOG_RECORD_SIZE) // 1FILEあたり20480ログ
+#define LOG_RECORD_SIZE 128     // header 16 byte + log 112 byte
+#define MAX_LOGS_PER_FILE (FILE_SIZE / LOG_RECORD_SIZE) // 1FILEあたり40960ログ
 #define MAX_FILES 3             // FLASHに保存可能なFILEの最大数
 
 static_assert(
@@ -93,9 +93,9 @@ static_assert(MAX_MAPS * SECTOR_SIZE == MAP_REGION_SIZE,
 namespace Flash {
     constexpr uint8_t MAP_FORMAT_VERSION = 2;
     constexpr uint8_t MAP_BITS_PER_CELL = 4;
-    constexpr uint8_t LOG_FORMAT_VERSION = 5;
+    constexpr uint8_t LOG_FORMAT_VERSION = 12;
 
-    // 100 ms周期の新版ログ。packedにしてPC側とoffsetを固定する。
+    // Compact 100 ms snapshot. Header + frame fits one 128-byte record.
     struct LogFrame {
         uint8_t format_version;
         int8_t flash_file_index;
@@ -104,91 +104,56 @@ namespace Flash {
         uint32_t message_number;
         uint32_t timestamp_ms;
         uint16_t valid_flags;
-        uint16_t fusion_status_flags;
+        uint16_t localization_status_flags;
 
-        int32_t lat_1e7;
-        int32_t lng_1e7;
-        int32_t gps_x_mm;
-        int32_t gps_y_mm;
         int32_t x_mm;
         int32_t y_mm;
         uint16_t yaw_deg_1e2;
         int16_t forward_velocity_mm_s;
-        int16_t yaw_rate_rad_s_x1000;
-        uint32_t position_std_mm;
-        uint16_t yaw_std_mrad;
-
+        int32_t lat_1e7;
+        int32_t lng_1e7;
         uint8_t gps_fix_type;
         uint8_t gps_satellites;
-        uint32_t gps_horizontal_accuracy_mm;
-        int32_t gps_velocity_east_mm_s;
-        int32_t gps_velocity_north_mm_s;
-        uint32_t gps_speed_accuracy_mm_s;
-
-        int16_t acc_x_mg;
-        int16_t acc_y_mg;
-        int16_t acc_z_mg;
-        int16_t gyro_z_rad_s_x1000;
-        uint16_t magnetic_yaw_deg_1e2;
-        int32_t pressure_pa;
-        int32_t encoder_left_mm;
-        int32_t encoder_right_mm;
-        uint16_t imu_age_ms;
-        uint16_t magnetic_age_ms;
-        uint16_t encoder_age_ms;
-        uint16_t gps_age_ms;
-
-        int8_t cell_x;
-        int8_t cell_y;
-        uint8_t attitude;
-        uint8_t stuck_reason;
-        uint8_t stuck_cell_x;
-        uint8_t stuck_cell_y;
-        int16_t jog_velocity_mm_s;
-        int16_t jog_omega_rad_s_x100;
-        uint16_t jog_remain_ms;
-
-        uint8_t camera_valid;
-        uint8_t camera_target_found;
-        uint8_t camera_confidence;
-        uint16_t camera_occupancy_permille;
+        uint16_t gps_horizontal_accuracy_mm;
+        uint8_t sensor_sources;
+        uint8_t camera_flags;
         int16_t camera_angle_error_deg10;
+        uint16_t camera_occupancy_permille;
+        uint8_t camera_confidence;
+        uint8_t stuck_reason;
+        uint8_t stuck_verification_result;
         uint8_t rasp_state;
         uint8_t gps_state;
-        uint8_t flash_used_flags;
-        uint8_t flash_storage_full;
-        uint32_t grid_map_update_count;
-        uint8_t fusion_quality;
-        uint8_t gps_health;
-        uint8_t encoder_health;
-        uint8_t imu_health;
-        uint8_t magnetic_health;
-        uint16_t motion_anomaly_flags;
-        uint16_t motion_anomaly_age_ms;
-
-        uint16_t stuck_score_wheel_blocked;
-        uint16_t stuck_score_wheel_slip;
-        uint16_t stuck_score_rotation_blocked;
-        uint16_t stuck_score_body_trapped;
-        uint8_t stuck_verification_phase;
-        uint8_t stuck_trigger_reason;
-        uint8_t stuck_recurrence_count;
-        uint8_t stuck_verification_result;
-        uint8_t stuck_hash_distance_bits;
-        int16_t stuck_probe_left_delta_mm;
-        int16_t stuck_probe_right_delta_mm;
-        int16_t stuck_probe_gyro_angle_mrad;
-        uint16_t stuck_tilt_deg_x10;
-        uint16_t stuck_gps_max_radius_mm;
-        uint16_t stuck_gps_encoder_distance_mm;
-        uint8_t stuck_gps_sample_count;
-        uint8_t stuck_diagnostics_valid;
-        int16_t encoder_left_velocity_mm_s;
-        int16_t encoder_right_velocity_mm_s;
+        uint8_t flash_state;
+        int16_t board_acc_x_mg;
+        int16_t board_acc_y_mg;
+        int16_t board_acc_z_mg;
+        int16_t board_gyro_x_rad_s_x1000;
+        int16_t board_gyro_y_rad_s_x1000;
+        int16_t board_gyro_z_rad_s_x1000;
+        int16_t can_acc_x_mg;
+        int16_t can_acc_y_mg;
+        int16_t can_acc_z_mg;
+        int16_t can_gyro_x_rad_s_x1000;
+        int16_t can_gyro_y_rad_s_x1000;
+        int16_t can_gyro_z_rad_s_x1000;
+        int16_t board_magnetic_x_uT_x10;
+        int16_t board_magnetic_y_uT_x10;
+        int16_t board_magnetic_z_uT_x10;
+        int16_t can_magnetic_x_uT_x10;
+        int16_t can_magnetic_y_uT_x10;
+        int16_t can_magnetic_z_uT_x10;
+        uint16_t pressure_pa_div10;
+        int32_t encoder_left_mm;
+        int32_t encoder_right_mm;
         uint64_t camera_scene_hash;
+        uint16_t gyro_samples_100ms;
+        uint8_t accel_samples_100ms;
+        uint8_t magnetic_samples_100ms;
+        uint16_t imu_fifo_overflow_count;
     } __attribute__((packed));
 
-    static_assert(sizeof(LogFrame) == 175, "Flash LogFrame v5 size mismatch");
+    static_assert(sizeof(LogFrame) == 112, "Flash LogFrame v12 size mismatch");
 }
 
 class SrvFlash

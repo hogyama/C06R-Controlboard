@@ -1,5 +1,7 @@
 #pragma once
 
+#include "domain/sensor/sensor_types.h"
+
 namespace SensorAxisTransform {
 
 struct Vector3 {
@@ -8,35 +10,45 @@ struct Vector3 {
     float z;
 };
 
-// IMU座標:
-//   X: 右、Y: 前、Z: 上
-//
-// Domain機体座標:
-//   X: 前、Y: 左、Z: 上
-inline Vector3 imuToBody(float sensor_x, float sensor_y, float sensor_z)
+// Domain body frame: X=forward, Y=left, Z=up.
+// The modules on ControlBoard are mounted to match this body frame.
+inline Vector3 boardImuToBody(float x, float y, float z)
 {
-    return {
-        sensor_y,
-        -sensor_x,
-        sensor_z
-    };
+    return {x, y, z};
 }
 
-// 地磁気センサー座標:
-//   X: 右、Y: 後ろ、Z: 下
-//
-// Domain機体座標:
-//   X: 前、Y: 左、Z: 上
-inline Vector3 magneticToBody(
-    float sensor_x,
-    float sensor_y,
-    float sensor_z)
+// CAN SensorBoard ICM20948 frame: X=right, Y=forward, Z=up.
+inline Vector3 canImuToBody(float x, float y, float z)
 {
-    return {
-        -sensor_y,
-        -sensor_x,
-        -sensor_z
-    };
+    return {y, -x, z};
+}
+
+inline Vector3 boardMagneticToBody(float x, float y, float z)
+{
+    // BMM350: X=left, Y=forward, Z=down.
+    return {y, x, -z};
+}
+
+// CAN SensorBoard AK09916 frame: X=right, Y=backward, Z=down.
+inline Vector3 canMagneticToBody(float x, float y, float z)
+{
+    return {-y, -x, -z};
+}
+
+inline Vector3 imuToBody(
+    Sensor::Source source, float x, float y, float z)
+{
+    return source == Sensor::Source::Can
+        ? canImuToBody(x, y, z)
+        : boardImuToBody(x, y, z);
+}
+
+inline Vector3 magneticToBody(
+    Sensor::Source source, float x, float y, float z)
+{
+    return source == Sensor::Source::Can
+        ? canMagneticToBody(x, y, z)
+        : boardMagneticToBody(x, y, z);
 }
 
 } // namespace SensorAxisTransform

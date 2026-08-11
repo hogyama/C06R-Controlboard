@@ -4,9 +4,11 @@
 #include "app_context.h"
 #include "algorithm/astar.h"
 #include "algorithm/pure_pursuit.h"
-#include "domain/fusion/fusion_types.h"
+#include "domain/localization/localization_types.h"
+#include "domain/navigation/camera_navigator.h"
 #include "platform/field_config.h"
 
+#include <esp_timer.h>
 #include <math.h>
 #include <string.h>
 
@@ -21,9 +23,14 @@ constexpr uint32_t INITIAL_MAP_WAIT_MS = 5000;
 constexpr uint32_t NAV_MAP_REQUEST_ID = 0x4E41564DU; // ASCII: NAVM
 
 // 100:1 Pololu 20Dを3S LiPoで駆動するため、低速域にも始動トルクを確保する。
-constexpr float GPS_BASE_SPEED_MM_S = 600.0f;
-constexpr float GPS_MIN_SPEED_MM_S = 400.0f;
-constexpr float GPS_MAX_SPEED_MM_S = 750.0f;
+constexpr float GPS_BASE_SPEED_MM_S = 700.0f;
+constexpr float GPS_MIN_SPEED_MM_S = 500.0f;
+constexpr float GPS_MAX_SPEED_MM_S = 850.0f;
+constexpr float YAW_RECOVERY_SPEED_MM_S = 450.0f;
+constexpr uint32_t PERMANENT_ZERO_JOG_TIMEOUT_MS = 3000;
+constexpr uint32_t YAW_ACQUIRE_BEFORE_RESET_MS = 6000;
+constexpr uint32_t YAW_RESET_RETRY_MS = 10000;
+constexpr uint32_t YAW_RECOVERY_STABILIZE_MS = 1000;
 
 // 急旋回時の過大な角速度を抑え、経路追従の行き過ぎを防ぐ。
 constexpr float GPS_MAX_TURN_RATE_RAD_S = 3.0f;
@@ -38,185 +45,13 @@ constexpr float FIELD_RECOVERY_HEADING_KP = 2.0f;
 constexpr float ROBOT_TRACK_WIDTH_MM = 180.0f;
 
 constexpr int32_t CAMERA_NAV_ENTER_DISTANCE_MM = 5000;
-constexpr uint32_t CAMERA_COMM_TIMEOUT_MS = 1200;
-constexpr uint32_t CAMERA_CONTROL_FRAME_TIMEOUT_MS = 400;
-constexpr uint32_t CAMERA_GYRO_TIMEOUT_MS = 100;
-constexpr uint32_t CAMERA_GYRO_MAX_DT_MS = 100;
 
-// 検出直後はカメラ値が揺れやすいため、連続検出を確認するまで停止する。
-
-constexpr uint8_t CAMERA_TARGET_CONFIRM_FRAMES = 2;
-
-// この機体は微小旋回が難しいため、±15度は正面として静止画像2枚で確認する。
-constexpr int16_t CAMERA_FORWARD_DEAD_BAND_DEG10 = 150;
-// 逆補正を使った後だけは、±30度までを粗い正面として低速前進を許可する。
-constexpr int16_t CAMERA_COARSE_FORWARD_DEAD_BAND_DEG10 = 300;
-constexpr int16_t CAMERA_GOAL_MAX_ANGLE_DEG10 = 100;
-constexpr uint8_t CAMERA_GOAL_MIN_CONFIDENCE = 70;
-constexpr uint16_t CAMERA_GOAL_OCCUPANCY_PERMILLE = 700;
-constexpr uint8_t CAMERA_GOAL_REQUIRED_FRAMES = 5;
-constexpr uint8_t CAMERA_ANGLE_HISTORY_SIZE = 2;
-
-constexpr float CAMERA_FAR_FORWARD_SPEED_MM_S = 800.0f;
-constexpr float CAMERA_NEAR_FORWARD_SPEED_MM_S = 450.0f;
-constexpr uint16_t CAMERA_NEAR_OCCUPANCY_PERMILLE = 250;
-
-// 前進開始はトルク確保のため即時、減速だけを緩やかにする。
-// 300 mm/s未満は実機で駆動力を得にくいため、その時点で停止指令へ切り替える。
-constexpr float CAMERA_FORWARD_DECELERATION_MM_S2 = 2500.0f;
-constexpr float CAMERA_FORWARD_DECEL_STOP_SPEED_MM_S = 300.0f;
-constexpr uint32_t CAMERA_FORWARD_DECEL_MAX_DT_MS = 100;
-
-// taskNavが停止判断できなくなった場合にも短時間でJogを失効させる。
-constexpr uint32_t CAMERA_CONTROL_COMMAND_MS = 80;
-
-// 静止摩擦を確実に越えるため、通常補正・探索とも旋回角速度を固定する。
-constexpr float CAMERA_TURN_OMEGA_RAD_S = 3.3f;
-constexpr float CAMERA_TURN_REACHED_RAD = 5.0f * (M_PI / 180.0f);
-constexpr float CAMERA_SEARCH_REACHED_RAD = 2.0f * (M_PI / 180.0f);
-constexpr float CAMERA_MAX_GYRO_RATE_RAD_S = 20.0f;
-constexpr float CAMERA_COAST_PREDICTION_S = 0.06f;
-constexpr float CAMERA_STILL_GYRO_RAD_S = 0.30f;
-constexpr float CAMERA_DELAY_GYRO_DEADBAND_RAD_S = 0.05f;
-constexpr float CAMERA_STILL_ENCODER_MM_S = 100.0f;
-constexpr uint32_t CAMERA_STILL_CONFIRM_MS = 200;
-constexpr uint32_t CAMERA_ENCODER_TIMEOUT_MS = 100;
-
-// 明示的な未検出ごとに45度旋回する
-// 探索では逆方向の補正旋回を行わない。
-constexpr float CAMERA_SEARCH_STEP_RAD = 45.0f * (M_PI / 180.0f);
-constexpr float CAMERA_TARGET_MAX_TURN_RAD = 45.0f * (M_PI / 180.0f);
-constexpr float CAMERA_SEARCH_FULL_TURN_RAD = 2.0f * M_PI;
-constexpr float CAMERA_SEARCH_LEG_BASE_MM = 500.0f;
-constexpr float CAMERA_SEARCH_LEG_MAX_MM = 1500.0f;
-constexpr float CAMERA_SEARCH_MOVE_SPEED_MM_S = 800.0f;
-constexpr float CAMERA_SEARCH_CORNER_RAD = 90.0f * (M_PI / 180.0f);
-
-constexpr uint8_t CAMERA_GYRO_HISTORY_SIZE = 64;
-
-enum class CameraPhase : uint8_t {
-    WaitFrame,
-    TurnDriving,
-    TurnCoasting,
-    StopSettling,
-    Forward,
-    TranslationDecelerating,
-    GoalConfirm,
-    SearchTranslate,
-    LinkHold,
-};
-
-enum class CameraTurnPurpose : uint8_t {
-    None,
-    Target,
-    SearchStep,
-    SearchCorner,
-};
-
-enum class CameraAfterStop : uint8_t {
-    WaitFrame,
-    StartSearch,
-    StartGoalConfirm,
-};
-
-struct CameraGyroSample {
-    uint32_t timestamp_ms;
-    float z_rad_s;
-};
-
-// カメラジャイロ履歴
-struct CameraGyroHistory {
-    CameraGyroSample samples[CAMERA_GYRO_HISTORY_SIZE]{};
-    uint8_t count = 0;
-    uint8_t write_index = 0;
-
-    void clear()
-    {
-        count = 0;
-        write_index = 0;
-    }
-
-    void add(const Can::Data::AngularVelocity& gyro)
-    {
-        if (count > 0) {
-            // 最新データのタイムスタンプが同じ場合は追加しない
-            const uint8_t newest_index =
-                (write_index + CAMERA_GYRO_HISTORY_SIZE - 1U) %
-                CAMERA_GYRO_HISTORY_SIZE;
-            if (samples[newest_index].timestamp_ms == gyro.ts_ms) return;
-        }
-        samples[write_index] = {gyro.ts_ms, gyro.z_rad_s};
-        write_index = (write_index + 1U) % CAMERA_GYRO_HISTORY_SIZE;
-        if (count < CAMERA_GYRO_HISTORY_SIZE) ++count;
-        // カウントが最大に達した場合、古いデータは上書きされる
-    }
-
-    bool integrateDelay(
-        uint32_t from_ms,
-        uint32_t to_ms,
-        float& angle_rad) const
-    {
-        angle_rad = 0.0f;
-        if (count < 2 || from_ms == 0 || to_ms <= from_ms) return false;
-
-        const uint8_t first =
-            (write_index + CAMERA_GYRO_HISTORY_SIZE - count) %
-            CAMERA_GYRO_HISTORY_SIZE;
-        bool covered_from = false;
-        bool used_interval = false;
-
-        for (uint8_t i = 0; i + 1U < count; ++i) {
-            // 2点の間の積分区間が、指定されたfrom_ms～to_msに重なっている場合のみ積分する
-            const CameraGyroSample& a =
-                samples[(first + i) % CAMERA_GYRO_HISTORY_SIZE];
-            const CameraGyroSample& b =
-                samples[(first + i + 1U) % CAMERA_GYRO_HISTORY_SIZE];
-            if (b.timestamp_ms <= a.timestamp_ms) continue;
-            if (b.timestamp_ms < from_ms || a.timestamp_ms > to_ms) continue;
-
-            // 積分区間の開始・終了点
-            const uint32_t segment_start =
-                a.timestamp_ms < from_ms ? from_ms : a.timestamp_ms;
-            const uint32_t segment_end =
-                b.timestamp_ms > to_ms ? to_ms : b.timestamp_ms;
-            if (segment_end <= segment_start) continue;
-
-            // 2点間の時間差（端以外は積分区間）
-            const float interval_ms =
-                static_cast<float>(b.timestamp_ms - a.timestamp_ms);
-
-            // 積分区間の開始・終了点の角速度を線形補間する
-            const float start_ratio =
-                (segment_start - a.timestamp_ms) / interval_ms;
-            const float end_ratio =
-                (segment_end - a.timestamp_ms) / interval_ms;
-            
-            // 積分区間の開始・終了点の角速度（端は線形補完）
-            float start_rate =
-                a.z_rad_s + (b.z_rad_s - a.z_rad_s) * start_ratio;
-            float end_rate =
-                a.z_rad_s + (b.z_rad_s - a.z_rad_s) * end_ratio;
-
-            // 画像遅延補正は静止ノイズを角度へ積算しない。
-            if (fabsf(start_rate) < CAMERA_DELAY_GYRO_DEADBAND_RAD_S) {
-                start_rate = 0.0f;
-            }
-            if (fabsf(end_rate) < CAMERA_DELAY_GYRO_DEADBAND_RAD_S) {
-                end_rate = 0.0f;
-            }
-
-            // 台形積分
-            angle_rad += 0.5f * (start_rate + end_rate) *
-                ((segment_end - segment_start) / 1000.0f);
-            covered_from = covered_from || a.timestamp_ms <= from_ms;
-            used_interval = true;
-        }
-        return covered_from && used_interval;
-    }
-};
 
 MotionCommandSource active_command_source =
     MotionCommandSource::GpsNavigation;
+NavigationRecoveryPhase active_recovery_phase =
+    NavigationRecoveryPhase::None;
+uint16_t active_navigation_reset_count = 0;
 
 /**
  * Jog送信関数
@@ -224,7 +59,8 @@ MotionCommandSource active_command_source =
 void publishJog(
     float velocity_mm_s,
     float omega_rad_s,
-    uint32_t duration_ms = JOG_DURATION_MS)
+    uint32_t duration_ms = JOG_DURATION_MS,
+    NavHoldReason hold_reason = NavHoldReason::None)
 {
     MotionCommandRequest request{};
     request.source = active_command_source;
@@ -233,15 +69,18 @@ void publishJog(
         static_cast<int16_t>(lroundf(omega_rad_s * 100.0f));
     request.duration_ms = static_cast<uint16_t>(duration_ms);
     request.timestamp_ms = millis();
+    request.nav_hold_reason = hold_reason;
+    request.recovery_phase = active_recovery_phase;
+    request.navigation_reset_count = active_navigation_reset_count;
     xQueueSend(fifo_motion_command_request, &request, 0);
 }
 
 /**
  * Stop送信関数
  */
-void publishStop()
+void publishStop(NavHoldReason hold_reason = NavHoldReason::None)
 {
-    publishJog(0.0f, 0.0f);
+    publishJog(0.0f, 0.0f, JOG_DURATION_MS, hold_reason);
 }
 
 /**
@@ -334,53 +173,15 @@ bool coordinateIsUsable(const Coordinate& coordinate, uint32_t now_ms)
     const bool fresh =
         static_cast<uint32_t>(now_ms - coordinate.timestamp_ms) <= COORDINATE_TIMEOUT_MS;
     const uint16_t required_status =
-        Domain::Fusion::STATUS_POSITION_USABLE |
-        Domain::Fusion::STATUS_YAW_USABLE;
-    const bool fusion_usable =
-        (coordinate.fusion_status_flags & required_status) ==
+        Domain::Localization::STATUS_POSITION_USABLE |
+        Domain::Localization::STATUS_YAW_USABLE;
+    const bool localization_usable =
+        (coordinate.localization_status_flags & required_status) ==
         required_status;
 
-    return fresh && fusion_usable && coordinate.is_first_gps_valid;
+    return fresh && localization_usable && coordinate.is_first_gps_valid;
 }
 
-bool cameraGyroIsUsable(
-    const Can::Data::AngularVelocity& angular_velocity,
-    uint32_t now_ms)
-{
-    return
-        static_cast<uint32_t>(now_ms - angular_velocity.ts_ms) <=
-            CAMERA_GYRO_TIMEOUT_MS &&
-        isfinite(angular_velocity.z_rad_s) &&
-        fabsf(angular_velocity.z_rad_s) <= CAMERA_MAX_GYRO_RATE_RAD_S;
-}
-
-bool driveCameraTurn(
-    float target_turn_rad,
-    float accumulated_turn_rad,
-    float gyro_z_rad_s,
-    float reached_rad = CAMERA_TURN_REACHED_RAD)
-{
-    const float remaining_turn_rad =
-        target_turn_rad - accumulated_turn_rad;
-    const float abs_remaining_turn_rad = fabsf(remaining_turn_rad);
-    const float turn_direction = remaining_turn_rad >= 0.0f ? 1.0f : -1.0f;
-    const float same_direction_rate =
-        fmaxf(0.0f, turn_direction * gyro_z_rad_s);
-    const float predicted_coast_angle =
-        same_direction_rate * CAMERA_COAST_PREDICTION_S;
-    const float stop_angle = reached_rad + predicted_coast_angle;
-
-    if (abs_remaining_turn_rad <= stop_angle) {
-        publishStop();
-        return true;
-    }
-
-    const float omega_rad_s =
-        turn_direction * CAMERA_TURN_OMEGA_RAD_S;
-
-    publishJog(0.0f, omega_rad_s, CAMERA_CONTROL_COMMAND_MS);
-    return false;
-}
 
 void loadInitialMapFromFlash()
 {
@@ -448,49 +249,15 @@ void taskNav(void *pvParameters)
     uint32_t planned_map_update_count = 0;
     uint32_t last_replan_ms = 0;
     SystemState previous_state = SystemState::STATE_PRELAUNCH;
+    NavigationRecoveryPhase recovery_phase =
+        NavigationRecoveryPhase::None;
+    NavHoldReason recovery_reason = NavHoldReason::None;
+    uint32_t recovery_phase_started_ms = 0;
+    uint32_t last_navigation_reset_request_ms = 0;
+    uint32_t zero_jog_started_ms = 0;
     AStar::GridPos last_traversed_cell{};
     bool have_last_traversed_cell = false;
 
-    uint32_t last_camera_msg_number = 0;
-    uint32_t last_camera_frame_ms = 0;
-    uint8_t camera_target_confirm_count = 0;
-    uint8_t camera_goal_detect_count = 0;
-    int16_t camera_angle_history[CAMERA_ANGLE_HISTORY_SIZE] = {};
-    uint8_t camera_angle_history_count = 0;
-    uint8_t camera_angle_history_write_index = 0;
-    int16_t camera_filtered_angle_deg10 = 0;
-    CameraPhase camera_phase = CameraPhase::WaitFrame;
-    CameraAfterStop camera_after_stop = CameraAfterStop::WaitFrame;
-    CameraTurnPurpose camera_turn_purpose = CameraTurnPurpose::None;
-    float camera_turn_target_rad = 0.0f;
-    float camera_accumulated_turn_rad = 0.0f;
-    float camera_previous_gyro_z_rad_s = 0.0f;
-    uint32_t camera_previous_gyro_timestamp_ms = 0;
-    uint32_t camera_still_started_ms = 0;
-    // 正面へ収まるまで、停止後画像による逆方向補正は1回だけ許可する。
-    int8_t camera_last_target_turn_direction = 0;
-    bool camera_target_reverse_used = false;
-    bool camera_coarse_forward_active = false;
-    uint8_t camera_large_error_confirm_count = 0;
-    int8_t camera_large_error_direction = 0;
-    CameraGyroHistory camera_gyro_history{};
-
-    Can::Data::Encoder camera_previous_encoder{};
-    bool camera_have_previous_encoder = false;
-    float camera_left_velocity_mm_s = 0.0f;
-    float camera_right_velocity_mm_s = 0.0f;
-    uint32_t camera_encoder_velocity_ms = 0;
-
-    // CAMERA_NAVの直進指令だけを保持し、停止前の減速に使用する。
-    float camera_forward_command_mm_s = 0.0f;
-    uint32_t camera_forward_command_ms = 0;
-
-    bool camera_search_requested = false;
-    float camera_search_accumulated_rad = 0.0f;
-    uint8_t camera_search_leg_index = 0;
-    int32_t camera_search_start_left_mm = 0;
-    int32_t camera_search_start_right_mm = 0;
-    float camera_search_target_distance_mm = 0.0f;
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(NAV_PERIOD_MS);
@@ -536,9 +303,14 @@ void taskNav(void *pvParameters)
         SystemData status{};
         if (xQueuePeek(mbx_system_data, &status, 0) != pdTRUE) {
             active_command_source = MotionCommandSource::Safety;
+            active_recovery_phase = NavigationRecoveryPhase::None;
+            active_navigation_reset_count = 0;
             publishStop();
             continue;
         }
+        active_navigation_reset_count =
+            status.navigation_reset_count;
+        active_recovery_phase = recovery_phase;
 
         if (status.state == SystemState::STATE_GPS_NAV) {
             active_command_source = MotionCommandSource::GpsNavigation;
@@ -565,43 +337,15 @@ void taskNav(void *pvParameters)
             pp_state = PurePursuit::PathState{};
             have_last_traversed_cell = false;
             field_recovery_active = false;
+            recovery_phase = NavigationRecoveryPhase::None;
+            recovery_reason = NavHoldReason::None;
+            recovery_phase_started_ms = 0;
+            last_navigation_reset_request_ms = 0;
+            zero_jog_started_ms = 0;
+            active_recovery_phase = NavigationRecoveryPhase::None;
 
             if (status.state == SystemState::STATE_CAMERA_NAV) {
-                last_camera_msg_number = 0;
-                last_camera_frame_ms = 0;
-                camera_target_confirm_count = 0;
-                camera_goal_detect_count = 0;
-                memset(camera_angle_history, 0, sizeof(camera_angle_history));
-                camera_angle_history_count = 0;
-                camera_angle_history_write_index = 0;
-                camera_filtered_angle_deg10 = 0;
-                camera_phase = CameraPhase::WaitFrame;
-                camera_after_stop = CameraAfterStop::WaitFrame;
-                camera_turn_purpose = CameraTurnPurpose::None;
-                camera_turn_target_rad = 0.0f;
-                camera_accumulated_turn_rad = 0.0f;
-                camera_previous_gyro_z_rad_s = 0.0f;
-                camera_previous_gyro_timestamp_ms = 0;
-                camera_still_started_ms = 0;
-                camera_last_target_turn_direction = 0;
-                camera_target_reverse_used = false;
-                camera_coarse_forward_active = false;
-                camera_large_error_confirm_count = 0;
-                camera_large_error_direction = 0;
-                camera_gyro_history.clear();
-                camera_previous_encoder = {};
-                camera_have_previous_encoder = false;
-                camera_left_velocity_mm_s = 0.0f;
-                camera_right_velocity_mm_s = 0.0f;
-                camera_encoder_velocity_ms = 0;
-                camera_forward_command_mm_s = 0.0f;
-                camera_forward_command_ms = 0;
-                camera_search_requested = false;
-                camera_search_accumulated_rad = 0.0f;
-                camera_search_leg_index = 0;
-                camera_search_start_left_mm = 0;
-                camera_search_start_right_mm = 0;
-                camera_search_target_distance_mm = 0.0f;
+                CameraNavigation::reset();
             }
             previous_state = status.state;
             publishNavigationProgress(now_ms, planned_map_update_count, nullptr);
@@ -614,9 +358,126 @@ void taskNav(void *pvParameters)
 
         if (status.state == SystemState::STATE_GPS_NAV) {
             Coordinate coordinate{};
-            if (xQueuePeek(mbx_coordinate, &coordinate, 0) != pdTRUE ||
-                !coordinateIsUsable(coordinate, now_ms)) {
-                publishStop();
+            const bool has_coordinate =
+                xQueuePeek(mbx_coordinate, &coordinate, 0) == pdTRUE;
+            const bool coordinate_fresh = has_coordinate &&
+                coordinate.timestamp_ms != 0U &&
+                static_cast<uint32_t>(
+                    now_ms - coordinate.timestamp_ms) <=
+                    COORDINATE_TIMEOUT_MS;
+            const bool position_usable = coordinate_fresh &&
+                (coordinate.localization_status_flags &
+                 Domain::Localization::STATUS_POSITION_USABLE) != 0U;
+            const bool yaw_usable = coordinate_fresh &&
+                (coordinate.localization_status_flags &
+                 Domain::Localization::STATUS_YAW_USABLE) != 0U;
+            const bool coordinate_usable =
+                coordinate_fresh && position_usable && yaw_usable &&
+                coordinate.is_first_gps_valid;
+
+            JogData active_jog{};
+            const bool active_jog_valid =
+                xQueuePeek(mbx_can_jog_cmd, &active_jog, 0) == pdTRUE &&
+                static_cast<uint32_t>(
+                    now_ms - active_jog.timestamp_ms) <
+                    active_jog.duration_ms;
+            const bool jog_is_zero = !active_jog_valid ||
+                (fabsf(active_jog.velocity_mm_s) < 1.0f &&
+                 fabsf(active_jog.omega_rad_s) < 0.01f);
+            if (jog_is_zero) {
+                if (zero_jog_started_ms == 0U) {
+                    zero_jog_started_ms = now_ms;
+                }
+            } else {
+                zero_jog_started_ms = 0U;
+            }
+            const bool zero_jog_watchdog_expired =
+                zero_jog_started_ms != 0U &&
+                static_cast<uint32_t>(
+                    now_ms - zero_jog_started_ms) >=
+                    PERMANENT_ZERO_JOG_TIMEOUT_MS;
+
+            if (recovery_phase == NavigationRecoveryPhase::None &&
+                (!coordinate_usable || zero_jog_watchdog_expired)) {
+                recovery_phase =
+                    NavigationRecoveryPhase::YawCourseAcquire;
+                recovery_phase_started_ms = now_ms;
+                path_valid = false;
+                if (!has_coordinate || !coordinate_fresh) {
+                    recovery_reason =
+                        NavHoldReason::CoordinateUnavailable;
+                } else if (!position_usable) {
+                    recovery_reason = NavHoldReason::PositionUnusable;
+                } else if (!yaw_usable) {
+                    recovery_reason = NavHoldReason::YawUnusable;
+                } else {
+                    recovery_reason = NavHoldReason::NoCommand;
+                }
+            }
+
+            if (recovery_phase != NavigationRecoveryPhase::None) {
+                if (coordinate_usable) {
+                    if (recovery_phase !=
+                        NavigationRecoveryPhase::Stabilizing) {
+                        recovery_phase =
+                            NavigationRecoveryPhase::Stabilizing;
+                        recovery_phase_started_ms = now_ms;
+                    } else if (static_cast<uint32_t>(
+                            now_ms - recovery_phase_started_ms) >=
+                            YAW_RECOVERY_STABILIZE_MS) {
+                        recovery_phase = NavigationRecoveryPhase::None;
+                        recovery_reason = NavHoldReason::None;
+                        recovery_phase_started_ms = 0U;
+                        zero_jog_started_ms = 0U;
+                        path_valid = false;
+                    }
+                }
+
+                if (recovery_phase != NavigationRecoveryPhase::None) {
+                    if (recovery_phase ==
+                            NavigationRecoveryPhase::YawCourseAcquire &&
+                        static_cast<uint32_t>(
+                            now_ms - recovery_phase_started_ms) >=
+                            YAW_ACQUIRE_BEFORE_RESET_MS) {
+                        requestState(
+                            SystemCmdType::NavigationRecoveryReset);
+                        recovery_phase =
+                            NavigationRecoveryPhase::AwaitFreshGps;
+                        recovery_phase_started_ms = now_ms;
+                        last_navigation_reset_request_ms = now_ms;
+                        recovery_reason = NavHoldReason::RecoveryReset;
+                    } else if (recovery_phase ==
+                                   NavigationRecoveryPhase::AwaitFreshGps &&
+                               static_cast<uint32_t>(
+                                   now_ms -
+                                   last_navigation_reset_request_ms) >=
+                                   YAW_RESET_RETRY_MS) {
+                        requestState(
+                            SystemCmdType::NavigationRecoveryReset);
+                        last_navigation_reset_request_ms = now_ms;
+                        recovery_reason = NavHoldReason::RecoveryReset;
+                    }
+
+                    active_command_source =
+                        MotionCommandSource::NavigationRecovery;
+                    active_recovery_phase = recovery_phase;
+                    active_navigation_reset_count =
+                        status.navigation_reset_count;
+                    publishJog(
+                        YAW_RECOVERY_SPEED_MM_S,
+                        0.0f,
+                        JOG_DURATION_MS,
+                        recovery_reason);
+                    publishNavigationProgress(
+                        now_ms, planned_map_update_count, nullptr);
+                    continue;
+                }
+            }
+
+            active_recovery_phase = NavigationRecoveryPhase::None;
+            active_command_source = MotionCommandSource::GpsNavigation;
+            if (!coordinateIsUsable(coordinate, now_ms)) {
+                publishStop(NavHoldReason::LocalizationFailed);
                 publishNavigationProgress(
                     now_ms, planned_map_update_count, nullptr);
                 continue;
@@ -675,7 +536,7 @@ void taskNav(void *pvParameters)
 
             // GPSゴール5m以内では、必ずカメラナビへ引き継ぐ。
             if (distance_to_goal_mm <= CAMERA_NAV_ENTER_DISTANCE_MM) {
-                publishStop();
+                publishStop(NavHoldReason::GoalTransition);
                 publishNavigationProgress(
                     now_ms, planned_map_update_count, nullptr);
                 requestState(SystemCmdType::StartCameraNav);
@@ -747,7 +608,7 @@ void taskNav(void *pvParameters)
             }
 
             if (!path_valid) {
-                publishStop();
+                publishStop(NavHoldReason::PathUnavailable);
                 publishNavigationProgress(
                     now_ms, planned_map_update_count, nullptr);
                 continue;
@@ -769,7 +630,9 @@ void taskNav(void *pvParameters)
                 now_ms, planned_map_update_count, &output);
 
             if (!output.valid || output.reached_goal) {
-                publishStop();
+                publishStop(output.reached_goal
+                    ? NavHoldReason::GoalTransition
+                    : NavHoldReason::PathUnavailable);
             } else {
                 publishJog(output.linear_velocity_mm_s, output.angular_velocity_rad_s);
             }
@@ -780,636 +643,25 @@ void taskNav(void *pvParameters)
             publishNavigationProgress(
                 now_ms, planned_map_update_count, nullptr);
 
-            // 100Hzのジャイロを履歴へ保存し、旋回中と惰性中はデッドバンドなしで積分する。
-            Can::Data::AngularVelocity camera_gyro{};
-            const bool camera_gyro_usable =
-                xQueuePeek(mbx_can_angular_velocity, &camera_gyro, 0) == pdTRUE &&
-                cameraGyroIsUsable(camera_gyro, now_ms);
-            if (camera_gyro_usable) {
-                camera_gyro_history.add(camera_gyro);
-                if ((camera_phase == CameraPhase::TurnDriving ||
-                     camera_phase == CameraPhase::TurnCoasting) &&
-                    camera_previous_gyro_timestamp_ms != 0 &&
-                    camera_gyro.ts_ms != camera_previous_gyro_timestamp_ms) {
-                    const uint32_t gyro_dt_ms = static_cast<uint32_t>(
-                        camera_gyro.ts_ms - camera_previous_gyro_timestamp_ms);
-                    if (gyro_dt_ms <= CAMERA_GYRO_MAX_DT_MS) {
-                        camera_accumulated_turn_rad += 0.5f *
-                            (camera_previous_gyro_z_rad_s +
-                             camera_gyro.z_rad_s) *
-                            (gyro_dt_ms / 1000.0f);
-                    }
-                }
-                if (camera_phase == CameraPhase::TurnDriving ||
-                    camera_phase == CameraPhase::TurnCoasting) {
-                    camera_previous_gyro_z_rad_s = camera_gyro.z_rad_s;
-                    camera_previous_gyro_timestamp_ms = camera_gyro.ts_ms;
-                }
+            CameraNavigation::Input input{};
+            input.now_ms = now_ms;
+            input.now_us = static_cast<uint64_t>(esp_timer_get_time());
+            input.has_camera =
+                xQueuePeek(mbx_camera_data, &input.camera, 0) == pdTRUE;
+            input.has_gyroscope =
+                xQueuePeek(mbx_gyroscope, &input.gyroscope, 0) == pdTRUE;
+            input.has_encoder =
+                xQueuePeek(mbx_can_encoder, &input.encoder, 0) == pdTRUE;
+
+            const CameraNavigation::Output output =
+                CameraNavigation::update(input);
+            publishJog(
+                output.velocity_mm_s,
+                output.omega_rad_s,
+                output.duration_ms);
+            if (output.goal_reached) {
+                requestState(SystemCmdType::NotifyGoal);
             }
-
-            // 累積エンコーダの実timestamp差から左右速度を求める。
-            Can::Data::Encoder camera_encoder{};
-            const bool camera_has_encoder =
-                xQueuePeek(mbx_can_encoder, &camera_encoder, 0) == pdTRUE;
-            if (camera_has_encoder &&
-                (!camera_have_previous_encoder ||
-                 camera_encoder.ts_ms != camera_previous_encoder.ts_ms)) {
-                if (camera_have_previous_encoder &&
-                    camera_encoder.ts_ms > camera_previous_encoder.ts_ms) {
-                    const uint32_t encoder_dt_ms = static_cast<uint32_t>(
-                        camera_encoder.ts_ms - camera_previous_encoder.ts_ms);
-                    if (encoder_dt_ms <= CAMERA_ENCODER_TIMEOUT_MS) {
-                        camera_left_velocity_mm_s =
-                            (camera_encoder.left_mm -
-                             camera_previous_encoder.left_mm) *
-                            (1000.0f / encoder_dt_ms);
-                        camera_right_velocity_mm_s =
-                            (camera_encoder.right_mm -
-                             camera_previous_encoder.right_mm) *
-                            (1000.0f / encoder_dt_ms);
-                        camera_encoder_velocity_ms = camera_encoder.ts_ms;
-                    } else {
-                        camera_encoder_velocity_ms = 0;
-                    }
-                }
-                camera_previous_encoder = camera_encoder;
-                camera_have_previous_encoder = true;
-            }
-
-            const bool camera_encoder_velocity_usable =
-                camera_encoder_velocity_ms != 0 &&
-                static_cast<uint32_t>(
-                    now_ms - camera_encoder_velocity_ms) <=
-                    CAMERA_ENCODER_TIMEOUT_MS;
-            const bool camera_is_still_now =
-                camera_gyro_usable && camera_encoder_velocity_usable &&
-                fabsf(camera_gyro.z_rad_s) < CAMERA_STILL_GYRO_RAD_S &&
-                fabsf(camera_left_velocity_mm_s) <
-                    CAMERA_STILL_ENCODER_MM_S &&
-                fabsf(camera_right_velocity_mm_s) <
-                    CAMERA_STILL_ENCODER_MM_S;
-            if (camera_is_still_now) {
-                if (camera_still_started_ms == 0) {
-                    camera_still_started_ms = now_ms;
-                }
-            } else {
-                camera_still_started_ms = 0;
-            }
-            const bool camera_still_confirmed =
-                camera_still_started_ms != 0 &&
-                static_cast<uint32_t>(now_ms - camera_still_started_ms) >=
-                    CAMERA_STILL_CONFIRM_MS;
-
-            auto startCameraTurn = [&](
-                CameraTurnPurpose purpose,
-                float target_rad) {
-                camera_phase = CameraPhase::TurnDriving;
-                camera_turn_purpose = purpose;
-                camera_turn_target_rad = target_rad;
-                camera_accumulated_turn_rad = 0.0f;
-                camera_still_started_ms = 0;
-                camera_previous_gyro_z_rad_s =
-                    camera_gyro_usable ? camera_gyro.z_rad_s : 0.0f;
-                camera_previous_gyro_timestamp_ms =
-                    camera_gyro_usable ? camera_gyro.ts_ms : 0;
-            };
-
-            auto startSearchTranslation = [&]() {
-                if (!camera_has_encoder) {
-                    camera_phase = CameraPhase::StopSettling;
-                    camera_after_stop = CameraAfterStop::WaitFrame;
-                    return;
-                }
-                const uint8_t expansion =
-                    static_cast<uint8_t>(camera_search_leg_index / 2U + 1U);
-                camera_search_target_distance_mm = fminf(
-                    CAMERA_SEARCH_LEG_BASE_MM * expansion,
-                    CAMERA_SEARCH_LEG_MAX_MM);
-                camera_search_start_left_mm = camera_encoder.left_mm;
-                camera_search_start_right_mm = camera_encoder.right_mm;
-                camera_phase = CameraPhase::SearchTranslate;
-                camera_still_started_ms = 0;
-            };
-
-            auto startTranslationDeceleration = [&] (
-                CameraAfterStop action) {
-                camera_phase = CameraPhase::TranslationDecelerating;
-                camera_after_stop = action;
-                camera_turn_purpose = CameraTurnPurpose::None;
-                camera_still_started_ms = 0;
-                camera_forward_command_ms = now_ms;
-            };
-
-            Rasp::CameraData camera_data{};
-            const bool has_frame =
-                xQueuePeek(mbx_camera_data, &camera_data, 0) == pdTRUE;
-            const Rasp::Frame& frame = camera_data.frame;
-            const bool new_frame = has_frame && frame.msg_number != last_camera_msg_number;
-
-            if (new_frame) {
-                last_camera_msg_number = frame.msg_number;
-                last_camera_frame_ms = camera_data.received_ms;
-                if (camera_phase == CameraPhase::LinkHold) {
-                    camera_phase = CameraPhase::WaitFrame;
-                }
-
-                float delay_yaw_rad = 0.0f;
-                camera_gyro_history.integrateDelay(
-                    camera_data.requested_ms,
-                    camera_data.received_ms,
-                    delay_yaw_rad);
-                const int32_t compensated_angle_deg10 = static_cast<int32_t>(
-                    lroundf(frame.angle_error_deg10 -
-                        delay_yaw_rad * (1800.0f / M_PI)));
-                const int16_t latest_angle_deg10 = static_cast<int16_t>(
-                    constrain(compensated_angle_deg10, -1800, 1800));
-
-                if (frame.target_found != 0) {
-                    // 低周期画像の遅れを抑えるため、最新90%・直前10%だけを混ぜる。
-                    if (camera_angle_history_count > 0) {
-                        const uint8_t previous_index =
-                            (camera_angle_history_write_index +
-                             CAMERA_ANGLE_HISTORY_SIZE - 1U) %
-                            CAMERA_ANGLE_HISTORY_SIZE;
-                        const int16_t previous_angle_deg10 =
-                            camera_angle_history[previous_index];
-                        const bool same_direction =
-                            (latest_angle_deg10 >= 0) ==
-                            (previous_angle_deg10 >= 0);
-                        camera_filtered_angle_deg10 = same_direction
-                            ? static_cast<int16_t>(
-                                (9 * static_cast<int32_t>(latest_angle_deg10) +
-                                 previous_angle_deg10) / 10)
-                            : latest_angle_deg10;
-                    } else {
-                        camera_filtered_angle_deg10 = latest_angle_deg10;
-                    }
-
-                    camera_angle_history[camera_angle_history_write_index] =
-                        latest_angle_deg10;
-                    camera_angle_history_write_index =
-                        (camera_angle_history_write_index + 1U) %
-                        CAMERA_ANGLE_HISTORY_SIZE;
-                    if (camera_angle_history_count < CAMERA_ANGLE_HISTORY_SIZE) {
-                        ++camera_angle_history_count;
-                    }
-
-                    const bool goal_candidate =
-                        frame.confidence >= CAMERA_GOAL_MIN_CONFIDENCE &&
-                        frame.occupancy_permille >= CAMERA_GOAL_OCCUPANCY_PERMILLE &&
-                        abs(camera_filtered_angle_deg10) <=
-                            CAMERA_GOAL_MAX_ANGLE_DEG10;
-
-                    // 目標を再発見したら、それまでの拡大四角形探索を最初からやり直す。
-                    camera_search_requested = false;
-                    camera_search_accumulated_rad = 0.0f;
-                    camera_search_leg_index = 0;
-
-                    if (camera_phase == CameraPhase::GoalConfirm) {
-                        if (goal_candidate && camera_still_confirmed) {
-                            if (camera_goal_detect_count <
-                                CAMERA_GOAL_REQUIRED_FRAMES) {
-                                ++camera_goal_detect_count;
-                            }
-                            if (camera_goal_detect_count >=
-                                CAMERA_GOAL_REQUIRED_FRAMES) {
-                                publishStop();
-                                requestState(SystemCmdType::NotifyGoal);
-                                camera_goal_detect_count = 0;
-                                continue;
-                            }
-                        } else {
-                            camera_goal_detect_count = 0;
-                            camera_phase = CameraPhase::WaitFrame;
-                        }
-                    }
-
-                    if (goal_candidate &&
-                        camera_phase != CameraPhase::GoalConfirm) {
-                        // 走行中の最初の候補は数えず、完全静止後の次フレームから数える。
-                        publishStop();
-                        camera_forward_command_mm_s = 0.0f;
-                        camera_forward_command_ms = now_ms;
-                        camera_phase = CameraPhase::StopSettling;
-                        camera_after_stop =
-                            CameraAfterStop::StartGoalConfirm;
-                        camera_turn_purpose = CameraTurnPurpose::None;
-                        camera_goal_detect_count = 0;
-                        camera_target_confirm_count = 0;
-                        camera_still_started_ms = 0;
-                    } else if (camera_phase == CameraPhase::WaitFrame) {
-                        const int16_t abs_angle =
-                            abs(camera_filtered_angle_deg10);
-                        if (frame.occupancy_permille >=
-                                CAMERA_GOAL_OCCUPANCY_PERMILLE &&
-                            frame.confidence < CAMERA_GOAL_MIN_CONFIDENCE) {
-                            publishStop();
-                            camera_target_confirm_count = 0;
-                        } else if (abs_angle >
-                                   CAMERA_FORWARD_DEAD_BAND_DEG10) {
-                            const int8_t requested_direction =
-                                camera_filtered_angle_deg10 >= 0 ? 1 : -1;
-                            const bool reversing =
-                                camera_last_target_turn_direction != 0 &&
-                                requested_direction !=
-                                    camera_last_target_turn_direction;
-                            if (camera_target_reverse_used &&
-                                abs_angle <=
-                                    CAMERA_COARSE_FORWARD_DEAD_BAND_DEG10) {
-                                // 逆補正後の小さな行き過ぎは、再旋回せず低速前進で吸収する。
-                                camera_large_error_confirm_count = 0;
-                                camera_large_error_direction = 0;
-                                camera_coarse_forward_active = true;
-                                if (camera_target_confirm_count <
-                                    CAMERA_TARGET_CONFIRM_FRAMES) {
-                                    ++camera_target_confirm_count;
-                                }
-                                if (camera_target_confirm_count >=
-                                    CAMERA_TARGET_CONFIRM_FRAMES) {
-                                    camera_phase = CameraPhase::Forward;
-                                }
-                            } else if (camera_target_reverse_used) {
-                                // 2回目の逆補正は即実行せず、同方向の停止画像2枚で再取得する。
-                                publishStop();
-                                camera_target_confirm_count = 0;
-                                camera_coarse_forward_active = false;
-                                if (camera_large_error_direction ==
-                                    requested_direction) {
-                                    if (camera_large_error_confirm_count <
-                                        CAMERA_TARGET_CONFIRM_FRAMES) {
-                                        ++camera_large_error_confirm_count;
-                                    }
-                                } else {
-                                    camera_large_error_direction =
-                                        requested_direction;
-                                    camera_large_error_confirm_count = 1;
-                                }
-                                if (camera_large_error_confirm_count >=
-                                    CAMERA_TARGET_CONFIRM_FRAMES) {
-                                    // 補正履歴を解除し、この画像を新しい補正サイクルの開始にする。
-                                    camera_last_target_turn_direction =
-                                        requested_direction;
-                                    camera_target_reverse_used = false;
-                                    camera_large_error_confirm_count = 0;
-                                    camera_large_error_direction = 0;
-                                    const float requested_turn_rad =
-                                        camera_filtered_angle_deg10 *
-                                        (M_PI / 1800.0f);
-                                    startCameraTurn(
-                                        CameraTurnPurpose::Target,
-                                        constrain(
-                                            requested_turn_rad,
-                                            -CAMERA_TARGET_MAX_TURN_RAD,
-                                            CAMERA_TARGET_MAX_TURN_RAD));
-                                }
-                            } else {
-                                camera_target_confirm_count = 0;
-                                camera_large_error_confirm_count = 0;
-                                camera_large_error_direction = 0;
-                                camera_coarse_forward_active = false;
-                                if (reversing) {
-                                    camera_target_reverse_used = true;
-                                }
-                                camera_last_target_turn_direction =
-                                    requested_direction;
-                                const float requested_turn_rad =
-                                    camera_filtered_angle_deg10 *
-                                    (M_PI / 1800.0f);
-                                startCameraTurn(
-                                    CameraTurnPurpose::Target,
-                                    constrain(
-                                        requested_turn_rad,
-                                        -CAMERA_TARGET_MAX_TURN_RAD,
-                                        CAMERA_TARGET_MAX_TURN_RAD));
-                            }
-                        } else {
-                            camera_last_target_turn_direction = 0;
-                            camera_target_reverse_used = false;
-                            camera_coarse_forward_active = false;
-                            camera_large_error_confirm_count = 0;
-                            camera_large_error_direction = 0;
-                            if (camera_target_confirm_count <
-                                CAMERA_TARGET_CONFIRM_FRAMES) {
-                                ++camera_target_confirm_count;
-                            }
-                            if (camera_target_confirm_count >=
-                                CAMERA_TARGET_CONFIRM_FRAMES) {
-                                camera_phase = CameraPhase::Forward;
-                            }
-                        }
-                    } else if (camera_phase == CameraPhase::Forward) {
-                        if (camera_coarse_forward_active &&
-                            abs(camera_filtered_angle_deg10) <=
-                                CAMERA_FORWARD_DEAD_BAND_DEG10) {
-                            // 低速前進中に正面へ戻ったら、次の制御周期から通常前進へ戻す。
-                            camera_coarse_forward_active = false;
-                            camera_last_target_turn_direction = 0;
-                            camera_target_reverse_used = false;
-                        }
-                        const int16_t allowed_angle_deg10 =
-                            camera_coarse_forward_active
-                                ? CAMERA_COARSE_FORWARD_DEAD_BAND_DEG10
-                                : CAMERA_FORWARD_DEAD_BAND_DEG10;
-                        if (frame.occupancy_permille >=
-                                CAMERA_GOAL_OCCUPANCY_PERMILLE) {
-                            publishStop();
-                            camera_forward_command_mm_s = 0.0f;
-                            camera_forward_command_ms = now_ms;
-                            camera_phase = CameraPhase::StopSettling;
-                            camera_after_stop = CameraAfterStop::WaitFrame;
-                            camera_target_confirm_count = 0;
-                            camera_still_started_ms = 0;
-                        } else if (abs(camera_filtered_angle_deg10) >
-                                   allowed_angle_deg10) {
-                            // 通常の再撮影停止は急停止せず、短い減速を挟む。
-                            startTranslationDeceleration(
-                                CameraAfterStop::WaitFrame);
-                            camera_target_confirm_count = 0;
-                        }
-                    } else if (
-                        camera_phase == CameraPhase::SearchTranslate) {
-                        startTranslationDeceleration(
-                            CameraAfterStop::WaitFrame);
-                    }
-                } else {
-                    // 探索へ進むのは、通信の鮮度切れではなく明示的な未検出だけ。
-                    camera_goal_detect_count = 0;
-                    camera_target_confirm_count = 0;
-                    camera_last_target_turn_direction = 0;
-                    camera_target_reverse_used = false;
-                    camera_coarse_forward_active = false;
-                    camera_large_error_confirm_count = 0;
-                    camera_large_error_direction = 0;
-                    camera_search_requested = true;
-                    if (camera_phase == CameraPhase::Forward ||
-                        camera_phase == CameraPhase::SearchTranslate ||
-                        camera_phase == CameraPhase::GoalConfirm) {
-                        if (camera_phase == CameraPhase::GoalConfirm) {
-                            publishStop();
-                            camera_forward_command_mm_s = 0.0f;
-                            camera_forward_command_ms = now_ms;
-                            camera_phase = CameraPhase::StopSettling;
-                            camera_after_stop = CameraAfterStop::StartSearch;
-                            camera_turn_purpose = CameraTurnPurpose::None;
-                            camera_still_started_ms = 0;
-                        } else {
-                            startTranslationDeceleration(
-                                CameraAfterStop::StartSearch);
-                        }
-                    } else if (camera_phase == CameraPhase::WaitFrame) {
-                        if (camera_still_confirmed) {
-                            startCameraTurn(
-                                CameraTurnPurpose::SearchStep,
-                                CAMERA_SEARCH_STEP_RAD);
-                            camera_search_requested = false;
-                        } else {
-                            camera_phase = CameraPhase::StopSettling;
-                            camera_after_stop =
-                                CameraAfterStop::StartSearch;
-                            camera_still_started_ms = 0;
-                        }
-                    }
-                }
-            }
-
-            const uint32_t camera_frame_age_ms =
-                last_camera_frame_ms != 0
-                    ? static_cast<uint32_t>(now_ms - last_camera_frame_ms)
-                    : UINT32_MAX;
-
-            // 1200ms通信断では途中の制御判断を破棄し、復帰後の新規フレームを待つ。
-            if (camera_frame_age_ms > CAMERA_COMM_TIMEOUT_MS) {
-                publishStop();
-                camera_forward_command_mm_s = 0.0f;
-                camera_forward_command_ms = now_ms;
-                camera_phase = CameraPhase::LinkHold;
-                camera_after_stop = CameraAfterStop::WaitFrame;
-                camera_turn_purpose = CameraTurnPurpose::None;
-                camera_turn_target_rad = 0.0f;
-                camera_accumulated_turn_rad = 0.0f;
-                camera_previous_gyro_timestamp_ms = 0;
-                camera_target_confirm_count = 0;
-                camera_goal_detect_count = 0;
-                camera_last_target_turn_direction = 0;
-                camera_target_reverse_used = false;
-                camera_coarse_forward_active = false;
-                camera_large_error_confirm_count = 0;
-                camera_large_error_direction = 0;
-                camera_search_requested = false;
-                continue;
-            }
-
-            // 400ms鮮度切れは移動だけを止める。未検出や探索開始とは解釈しない。
-            if (camera_frame_age_ms > CAMERA_CONTROL_FRAME_TIMEOUT_MS &&
-                (camera_phase == CameraPhase::TurnDriving ||
-                 camera_phase == CameraPhase::Forward ||
-                 camera_phase == CameraPhase::SearchTranslate ||
-                 camera_phase == CameraPhase::TranslationDecelerating)) {
-                publishStop();
-                camera_forward_command_mm_s = 0.0f;
-                camera_forward_command_ms = now_ms;
-                camera_phase = CameraPhase::StopSettling;
-                camera_after_stop = CameraAfterStop::WaitFrame;
-                camera_turn_purpose = CameraTurnPurpose::None;
-                camera_previous_gyro_timestamp_ms = 0;
-                camera_still_started_ms = 0;
-            }
-
-            if (camera_phase == CameraPhase::TurnDriving) {
-                if (!camera_gyro_usable) {
-                    publishStop();
-                    camera_phase = CameraPhase::StopSettling;
-                    camera_after_stop = CameraAfterStop::WaitFrame;
-                    camera_turn_purpose = CameraTurnPurpose::None;
-                    camera_previous_gyro_timestamp_ms = 0;
-                    camera_still_started_ms = 0;
-                } else {
-                    const float reached_rad =
-                        camera_turn_purpose == CameraTurnPurpose::SearchStep
-                            ? CAMERA_SEARCH_REACHED_RAD
-                            : CAMERA_TURN_REACHED_RAD;
-                    if (driveCameraTurn(
-                            camera_turn_target_rad,
-                            camera_accumulated_turn_rad,
-                            camera_gyro.z_rad_s,
-                            reached_rad)) {
-                        camera_phase = CameraPhase::TurnCoasting;
-                        camera_still_started_ms = 0;
-                    }
-                }
-                continue;
-            }
-
-            if (camera_phase == CameraPhase::TurnCoasting) {
-                publishStop();
-                if (!camera_still_confirmed) continue;
-
-                const CameraTurnPurpose completed_purpose =
-                    camera_turn_purpose;
-                const float completed_turn_rad =
-                    camera_accumulated_turn_rad;
-                camera_turn_purpose = CameraTurnPurpose::None;
-                camera_previous_gyro_timestamp_ms = 0;
-                camera_still_started_ms = 0;
-
-                if (completed_purpose == CameraTurnPurpose::SearchStep) {
-                    camera_search_accumulated_rad +=
-                        fabsf(completed_turn_rad);
-                    if (camera_search_accumulated_rad >=
-                        CAMERA_SEARCH_FULL_TURN_RAD) {
-                        camera_search_accumulated_rad = 0.0f;
-                        if (camera_search_leg_index == 0) {
-                            startSearchTranslation();
-                        } else {
-                            startCameraTurn(
-                                CameraTurnPurpose::SearchCorner,
-                                CAMERA_SEARCH_CORNER_RAD);
-                        }
-                    } else {
-                        camera_phase = CameraPhase::WaitFrame;
-                    }
-                } else if (
-                    completed_purpose == CameraTurnPurpose::SearchCorner) {
-                    startSearchTranslation();
-                } else if (camera_search_requested) {
-                    startCameraTurn(
-                        CameraTurnPurpose::SearchStep,
-                        CAMERA_SEARCH_STEP_RAD);
-                    camera_search_requested = false;
-                } else {
-                    camera_phase = CameraPhase::WaitFrame;
-                }
-                continue;
-            }
-
-            if (camera_phase == CameraPhase::StopSettling) {
-                publishStop();
-                camera_forward_command_mm_s = 0.0f;
-                camera_forward_command_ms = now_ms;
-                if (!camera_still_confirmed) continue;
-
-                const CameraAfterStop action = camera_after_stop;
-                camera_after_stop = CameraAfterStop::WaitFrame;
-                camera_still_started_ms = 0;
-                if (action == CameraAfterStop::StartGoalConfirm) {
-                    camera_goal_detect_count = 0;
-                    camera_phase = CameraPhase::GoalConfirm;
-                } else if (action == CameraAfterStop::StartSearch) {
-                    startCameraTurn(
-                        CameraTurnPurpose::SearchStep,
-                        CAMERA_SEARCH_STEP_RAD);
-                    camera_search_requested = false;
-                } else {
-                    camera_phase = CameraPhase::WaitFrame;
-                }
-                continue;
-            }
-
-            if (camera_phase == CameraPhase::SearchTranslate) {
-                if (!camera_has_encoder ||
-                    !camera_encoder_velocity_usable) {
-                    publishStop();
-                    camera_forward_command_mm_s = 0.0f;
-                    camera_forward_command_ms = now_ms;
-                    continue;
-                }
-                const float left_distance_mm = static_cast<float>(
-                    camera_encoder.left_mm - camera_search_start_left_mm);
-                const float right_distance_mm = static_cast<float>(
-                    camera_encoder.right_mm - camera_search_start_right_mm);
-                const float travelled_mm = fabsf(
-                    0.5f * (left_distance_mm + right_distance_mm));
-
-                if (travelled_mm >= camera_search_target_distance_mm) {
-                    if (camera_search_leg_index < UINT8_MAX) {
-                        ++camera_search_leg_index;
-                    }
-                    camera_search_accumulated_rad = 0.0f;
-                    startTranslationDeceleration(
-                        CameraAfterStop::WaitFrame);
-                } else {
-                    camera_forward_command_mm_s =
-                        CAMERA_SEARCH_MOVE_SPEED_MM_S;
-                    camera_forward_command_ms = now_ms;
-                    publishJog(
-                        camera_forward_command_mm_s,
-                        0.0f,
-                        CAMERA_CONTROL_COMMAND_MS);
-                }
-                continue;
-            }
-
-            if (camera_phase == CameraPhase::TranslationDecelerating) {
-                const uint32_t elapsed_ms = camera_forward_command_ms != 0U
-                    ? static_cast<uint32_t>(now_ms - camera_forward_command_ms)
-                    : NAV_PERIOD_MS;
-                const uint32_t limited_elapsed_ms = elapsed_ms >
-                        CAMERA_FORWARD_DECEL_MAX_DT_MS
-                    ? CAMERA_FORWARD_DECEL_MAX_DT_MS
-                    : elapsed_ms;
-                camera_forward_command_mm_s = fmaxf(
-                    0.0f,
-                    camera_forward_command_mm_s -
-                        CAMERA_FORWARD_DECELERATION_MM_S2 *
-                        static_cast<float>(limited_elapsed_ms) * 0.001f);
-                camera_forward_command_ms = now_ms;
-
-                if (camera_forward_command_mm_s <=
-                    CAMERA_FORWARD_DECEL_STOP_SPEED_MM_S) {
-                    camera_forward_command_mm_s = 0.0f;
-                    publishStop();
-                    camera_phase = CameraPhase::StopSettling;
-                    camera_still_started_ms = 0;
-                } else {
-                    publishJog(
-                        camera_forward_command_mm_s,
-                        0.0f,
-                        CAMERA_CONTROL_COMMAND_MS);
-                }
-                continue;
-            }
-
-            if (camera_phase == CameraPhase::Forward) {
-                if (!has_frame || frame.target_found == 0) {
-                    publishStop();
-                    camera_forward_command_mm_s = 0.0f;
-                    camera_forward_command_ms = now_ms;
-                } else {
-                    const float target_forward_speed = camera_coarse_forward_active
-                        ? CAMERA_NEAR_FORWARD_SPEED_MM_S
-                        : (frame.occupancy_permille <
-                            CAMERA_NEAR_OCCUPANCY_PERMILLE
-                            ? CAMERA_FAR_FORWARD_SPEED_MM_S
-                            : CAMERA_NEAR_FORWARD_SPEED_MM_S);
-
-                    // 加速は即時、800->450など速度を下げる側だけ減速率を適用する。
-                    const uint32_t elapsed_ms = camera_forward_command_ms != 0U
-                        ? static_cast<uint32_t>(now_ms - camera_forward_command_ms)
-                        : NAV_PERIOD_MS;
-                    const uint32_t limited_elapsed_ms = elapsed_ms >
-                            CAMERA_FORWARD_DECEL_MAX_DT_MS
-                        ? CAMERA_FORWARD_DECEL_MAX_DT_MS
-                        : elapsed_ms;
-                    if (camera_forward_command_mm_s > target_forward_speed) {
-                        camera_forward_command_mm_s = fmaxf(
-                            target_forward_speed,
-                            camera_forward_command_mm_s -
-                                CAMERA_FORWARD_DECELERATION_MM_S2 *
-                                static_cast<float>(limited_elapsed_ms) * 0.001f);
-                    } else {
-                        camera_forward_command_mm_s = target_forward_speed;
-                    }
-                    camera_forward_command_ms = now_ms;
-                    publishJog(
-                        camera_forward_command_mm_s,
-                        0.0f,
-                        CAMERA_CONTROL_COMMAND_MS);
-                }
-                continue;
-            }
-
-            // WaitFrame・GoalConfirm・LinkHoldは、新規フレームによる遷移まで停止する。
-            publishStop();
             continue;
         }
 

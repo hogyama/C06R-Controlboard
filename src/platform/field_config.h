@@ -6,8 +6,10 @@ namespace FieldConfig {
 
 // The surveyed centre goal is the only configured GPS point. The local
 // origin is the south-west corner, 30 m south and 30 m west of the goal.
-constexpr int32_t GOAL_LATITUDE_E7 = 356048027;
-constexpr int32_t GOAL_LONGITUDE_E7 = 1396819493;
+// constexpr int32_t GOAL_LATITUDE_E7 = 356053295;
+// constexpr int32_t GOAL_LONGITUDE_E7 = 1396831924;
+constexpr int32_t GOAL_LATITUDE_E7 = 356036919;
+constexpr int32_t GOAL_LONGITUDE_E7 = 1396839057;
 
 constexpr int32_t SIZE_X_MM = 60000;
 constexpr int32_t SIZE_Y_MM = 60000;

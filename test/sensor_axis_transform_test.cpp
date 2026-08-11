@@ -14,18 +14,30 @@ void expectNear(float actual, float expected)
 
 int main()
 {
-    // IMU: 右、前、上 -> 機体: 前、左、上
-    const SensorAxisTransform::Vector3 imu =
-        SensorAxisTransform::imuToBody(1.0f, 2.0f, 3.0f);
-    expectNear(imu.x, 2.0f);
-    expectNear(imu.y, -1.0f);
-    expectNear(imu.z, 3.0f);
+    // BOARD IMU is aligned; CAN IMU uses the legacy SensorBoard frame.
+    const SensorAxisTransform::Vector3 board_imu =
+        SensorAxisTransform::boardImuToBody(1.0f, 2.0f, 3.0f);
+    expectNear(board_imu.x, 1.0f);
+    expectNear(board_imu.y, 2.0f);
+    expectNear(board_imu.z, 3.0f);
 
-    // 地磁気: 右、後ろ、下 -> 機体: 前、左、上
-    const SensorAxisTransform::Vector3 magnetic =
-        SensorAxisTransform::magneticToBody(1.0f, 2.0f, 3.0f);
-    expectNear(magnetic.x, -2.0f);
-    expectNear(magnetic.y, -1.0f);
-    expectNear(magnetic.z, -3.0f);
+    const SensorAxisTransform::Vector3 can_imu =
+        SensorAxisTransform::canImuToBody(1.0f, 2.0f, 3.0f);
+    expectNear(can_imu.x, 2.0f);
+    expectNear(can_imu.y, -1.0f);
+    expectNear(can_imu.z, 3.0f);
+
+    // BOARD BMM350: left, forward, down -> body: forward, left, up.
+    const SensorAxisTransform::Vector3 board_magnetic =
+        SensorAxisTransform::boardMagneticToBody(1.0f, 2.0f, 3.0f);
+    expectNear(board_magnetic.x, 2.0f);
+    expectNear(board_magnetic.y, 1.0f);
+    expectNear(board_magnetic.z, -3.0f);
+
+    const SensorAxisTransform::Vector3 can_magnetic =
+        SensorAxisTransform::canMagneticToBody(1.0f, 2.0f, 3.0f);
+    expectNear(can_magnetic.x, -2.0f);
+    expectNear(can_magnetic.y, -1.0f);
+    expectNear(can_magnetic.z, -3.0f);
     return 0;
 }

@@ -5,18 +5,40 @@
 #include "app_queue.h"
 #include "app_context.h"
 #include "service/Rasp/srv_rasp.h"
+#include <cstring>
 
 namespace {
+
+Rasp::CameraParameters makeCameraParameters(bool image_mode)
+{
+    Rasp::CameraParameters parameters{};
+    parameters.version = 2;
+    parameters.image_mode = image_mode ? 1U : 0U;
+    parameters.min_target_area_px = CAMERA_MIN_TARGET_AREA_PX;
+    parameters.confidence_full_area_px = CAMERA_CONFIDENCE_FULL_AREA_PX;
+    parameters.horizontal_fov_deg_x100 = CAMERA_HORIZONTAL_FOV_DEG_X100;
+    memcpy(parameters.hsv_low1, CAMERA_HSV_LOW1, sizeof(parameters.hsv_low1));
+    memcpy(parameters.hsv_high1, CAMERA_HSV_HIGH1, sizeof(parameters.hsv_high1));
+    memcpy(parameters.hsv_low2, CAMERA_HSV_LOW2, sizeof(parameters.hsv_low2));
+    memcpy(parameters.hsv_high2, CAMERA_HSV_HIGH2, sizeof(parameters.hsv_high2));
+    parameters.blur_kernel_size = CAMERA_BLUR_KERNEL_SIZE;
+    parameters.morph_kernel_size = CAMERA_MORPH_KERNEL_SIZE;
+    parameters.transform_flags =
+        (CAMERA_ROTATE_180 ? Rasp::CAMERA_TRANSFORM_ROTATE_180 : 0U) |
+        (CAMERA_MIRROR_HORIZONTAL
+            ? Rasp::CAMERA_TRANSFORM_MIRROR_HORIZONTAL
+            : 0U);
+    return parameters;
+}
 
 // DEBUGではUARTピンへ触れず、電源と制御信号だけを非アクティブにする。
 void holdRaspPowerOff()
 {
     pinMode(RASP_EN, OUTPUT);
-    pinMode(RASP_HANDSHAKE, OUTPUT);
-    pinMode(RASP_IMAGE_MODE, OUTPUT);
     digitalWrite(RASP_EN, LOW);
-    digitalWrite(RASP_HANDSHAKE, LOW);
-    digitalWrite(RASP_IMAGE_MODE, LOW);
+    pinMode(RASP_UART_RX, INPUT);
+    pinMode(RASP_UART_TX, INPUT);
+    pinMode(RASP_HEARTBEAT, INPUT_PULLDOWN);
     pinMode(RASP_CAMERA_READY, INPUT_PULLDOWN);
 }
 
@@ -38,8 +60,9 @@ void taskRasp(void *pvParameters)
     }
 
     const bool initialized = rasp.init(
+        RASP_UART_RX,
         RASP_UART_TX,
-        RASP_HANDSHAKE,
+        RASP_HEARTBEAT,
         RASP_CAMERA_READY,
         RASP_EN,
         RASP_UART_NUM,
@@ -52,16 +75,13 @@ void taskRasp(void *pvParameters)
     SystemData system_data{};
     uint32_t last_published_msg_number = 0;
     bool have_published_frame = false;
-    bool image_mode_applied = false;
     bool ready_seen = false;
     bool power_cycle_failed = false;
-    bool power_off_pending = false;
     uint8_t startup_retry_count = 0;
     uint8_t ready_drop_retry_count = 0;
     uint32_t power_started_ms = 0;
     uint32_t power_off_ms = millis() - 3000U;
     uint32_t ready_low_started_ms = 0;
-    uint32_t power_off_requested_ms = 0;
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
@@ -116,50 +136,30 @@ void taskRasp(void *pvParameters)
             power_cycle_failed = false;
             startup_retry_count = 0;
             ready_drop_retry_count = 0;
-            digitalWrite(RASP_IMAGE_MODE, LOW);
             continue;
         }
 
-        // Make request/image lines inactive, then cut power after 200 ms.
         if (!should_power_on && status.power_enabled) {
-            if (!power_off_pending) {
-                digitalWrite(RASP_HANDSHAKE, LOW);
-                digitalWrite(RASP_IMAGE_MODE, LOW);
-                power_off_requested_ms = now;
-                power_off_pending = true;
-            } else if (now - power_off_requested_ms >= 200U) {
-                rasp.powerOff();
-                power_off_ms = now;
-                power_off_pending = false;
-                image_mode_applied = false;
-                ready_seen = false;
-                power_cycle_failed = false;
-                startup_retry_count = 0;
-                ready_drop_retry_count = 0;
-            }
+            rasp.powerOff();
+            power_off_ms = now;
+            ready_seen = false;
+            power_cycle_failed = false;
+            startup_retry_count = 0;
+            ready_drop_retry_count = 0;
             continue;
         }
-        power_off_pending = false;
 
         // Keep RASP_EN low for at least 3 s between power cycles.
         if (should_power_on && !status.power_enabled && !power_cycle_failed) {
             if (now - power_off_ms >= 3000U && rasp.powerOn()) {
                 power_started_ms = now;
-                image_mode_applied = false;
                 ready_seen = false;
                 ready_low_started_ms = 0;
             }
             continue;
         }
 
-        // Pi reads IMAGE_MODE during startup. Apply it 200 ms after RASP_EN.
-        if (status.power_enabled && !image_mode_applied &&
-            now - power_started_ms >= 200U) {
-            digitalWrite(RASP_IMAGE_MODE, requested_image_mode ? HIGH : LOW);
-            image_mode_applied = true;
-        }
-
-        if (status.camera_ready) {
+        if (status.camera_ready && status.heartbeat_alive) {
             ready_seen = true;
             ready_low_started_ms = 0;
         } else if (ready_seen && ready_low_started_ms == 0) {
@@ -167,29 +167,34 @@ void taskRasp(void *pvParameters)
         }
 
         const bool startup_timed_out =
-            status.power_enabled && !ready_seen &&
+            should_receive_camera && status.power_enabled && !ready_seen &&
             now - power_started_ms >= 90000U;
         const bool ready_drop_timed_out =
-            ready_seen && !status.camera_ready &&
+            should_receive_camera && ready_seen &&
+            (!status.camera_ready || !status.heartbeat_alive) &&
             ready_low_started_ms != 0 && now - ready_low_started_ms >= 10000U;
         if (startup_timed_out || ready_drop_timed_out) {
             const bool can_retry = startup_timed_out
                 ? startup_retry_count++ < 1U
                 : ready_drop_retry_count++ < 1U;
-            digitalWrite(RASP_IMAGE_MODE, LOW);
             rasp.powerOff();
             power_off_ms = now;
-            image_mode_applied = false;
             ready_seen = false;
             ready_low_started_ms = 0;
             power_cycle_failed = !can_retry;
             continue;
         }
 
+        // READY requires a previously received frame, so it cannot gate the
+        // first request. Start once the Pi has raised CAMERA_READY and the
+        // startup image-mode pin has been applied.
         if (should_receive_camera &&
-            rasp.getState() == SrvRasp::RaspState::Ready &&
+            status.power_enabled &&
+            status.heartbeat_alive &&
             !status.camera_reception_started) {
-            rasp.startCameraReception();
+            const Rasp::CameraParameters parameters =
+                makeCameraParameters(requested_image_mode);
+            rasp.startCameraReception(parameters);
         }
 
         if (should_receive_camera) {

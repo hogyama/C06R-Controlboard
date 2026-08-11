@@ -41,7 +41,10 @@ void taskCan(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
+    xQueueReset(fifo_can_gyroscope);
     uint32_t last_send_ms = millis() - CAN_SEND_PERIOD_MS;
+    Sensor::AccelerometerData acceleration_data{};
+    Sensor::GyroscopeData gyroscope_data{};
     while (true){
         vTaskDelayUntil(&last_wake, period);
 
@@ -144,41 +147,53 @@ void taskCan(void *pvParameters) {
             }
         }
 
-        Can::Data::Heading heading_data{};
-        Can::Data::Sensor sensor_data{};
-        Can::Data::MagneticField magnetic_data{};
-        Can::Data::AngularVelocity angular_velocity_data{};
+        Sensor::MagneticData magnetic_data{};
+        Sensor::PressureData pressure_data{};
         Can::Data::Encoder encoder_data{};
         Can::Data::Event event_data{};
 
         if (boot_mode == BootMode::DEBUG) {
-            // DEBUGではCANを動かすが、受信値を共有mailboxや状態遷移へ渡さない。
-            while (can.read(&heading_data)) {}
-            while (can.read(&sensor_data)) {}
-            while (can.read(&magnetic_data)) {}
-            while (can.read(&angular_velocity_data)) {}
+            // DEBUGでもセンサー診断と強制gyro校正のため受信値を公開する。
+            while (can.read(&acceleration_data)) {
+                xQueueOverwrite(mbx_can_acceleration, &acceleration_data);
+            }
+            while (can.read(&magnetic_data)) {
+                xQueueOverwrite(mbx_can_magnetic, &magnetic_data);
+            }
+            while (can.read(&pressure_data)) {
+                xQueueOverwrite(mbx_pressure, &pressure_data);
+            }
+            while (can.read(&gyroscope_data)) {
+                pushGyroscopeRing(fifo_can_gyroscope, gyroscope_data);
+                pushGyroscopeRing(fifo_stuck_can_gyroscope, gyroscope_data);
+                xQueueOverwrite(mbx_can_gyroscope, &gyroscope_data);
+            }
             while (can.read(&encoder_data)) {}
             while (can.readEvent().bytes != Can::Data::EventBytes::None) {}
             continue;
         }
 
-        if(can.read(&heading_data)){
-            xQueueOverwrite(mbx_can_heading, &heading_data);
+        while(can.read(&acceleration_data)){
+            xQueueOverwrite(mbx_can_acceleration, &acceleration_data);
         }
-        if(can.read(&sensor_data)){
-            xQueueOverwrite(mbx_can_sensor, &sensor_data);
-        }
-        if(can.read(&magnetic_data)){
+        while(can.read(&magnetic_data)){
             xQueueOverwrite(mbx_can_magnetic, &magnetic_data);
         }
-        if(can.read(&angular_velocity_data)){
-            xQueueOverwrite(
-                mbx_can_angular_velocity,
-                &angular_velocity_data
-            );
+        while(can.read(&pressure_data)){
+            xQueueOverwrite(mbx_pressure, &pressure_data);
         }
-        if(can.read(&encoder_data)){
+        while(can.read(&gyroscope_data)){
+            pushGyroscopeRing(fifo_can_gyroscope, gyroscope_data);
+            pushGyroscopeRing(fifo_stuck_can_gyroscope, gyroscope_data);
+            xQueueOverwrite(mbx_can_gyroscope, &gyroscope_data);
+        }
+        while(can.read(&encoder_data)){
             xQueueOverwrite(mbx_can_encoder, &encoder_data);
+            if (xQueueSend(fifo_can_encoder, &encoder_data, 0) != pdTRUE) {
+                Can::Data::Encoder discarded{};
+                xQueueReceive(fifo_can_encoder, &discarded, 0);
+                xQueueSend(fifo_can_encoder, &encoder_data, 0);
+            }
         }
         event_data = can.readEvent();
         if(event_data.bytes != Can::Data::EventBytes::None){

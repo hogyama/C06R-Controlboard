@@ -10,6 +10,8 @@ namespace {
 constexpr uint32_t ARBITER_PERIOD_MS = 10;
 constexpr int16_t MAX_VELOCITY_MM_S = 1000;
 constexpr int16_t MAX_OMEGA_X100 = 500;
+constexpr int16_t GPS_YAW_AIDING_MIN_COMMAND_MM_S = 400;
+constexpr int16_t RECOVERY_MAX_VELOCITY_MM_S = 500;
 
 constexpr uint8_t sourceIndex(MotionCommandSource source)
 {
@@ -69,39 +71,91 @@ void taskMotionArbiter(void* pvParameters)
         jog.timestamp_ms = now_ms;
         jog.duration_ms = ARBITER_PERIOD_MS * 3U;
         jog.source = JogSource::Navigation;
+        jog.nav_hold_reason = NavHoldReason::NoCommand;
 
         if (selected >= 0) {
             const MotionCommandRequest& request = latest[selected];
             float scale = 1.0f;
+            NavHoldReason hold_reason = request.nav_hold_reason;
 
             Coordinate coordinate{};
             const bool has_coordinate =
                 xQueuePeek(mbx_coordinate, &coordinate, 0) == pdTRUE;
             if (request.source == MotionCommandSource::GpsNavigation) {
-                if (!has_coordinate ||
-                    coordinate.fusion_quality ==
-                        Domain::Fusion::Quality::Failed ||
-                    coordinate.fusion_quality ==
-                        Domain::Fusion::Quality::Unreliable) {
+                const bool position_usable = has_coordinate &&
+                    (coordinate.localization_status_flags &
+                     Domain::Localization::STATUS_POSITION_USABLE) != 0U;
+                const bool yaw_usable = has_coordinate &&
+                    (coordinate.localization_status_flags &
+                     Domain::Localization::STATUS_YAW_USABLE) != 0U;
+                const bool only_magnetic_unhealthy =
+                    position_usable && yaw_usable &&
+                    coordinate.localization_quality ==
+                        Domain::Localization::Quality::Degraded &&
+                    coordinate.magnetic_health ==
+                        Domain::Localization::SensorHealth::Failed &&
+                    coordinate.gps_health !=
+                        Domain::Localization::SensorHealth::Failed &&
+                    coordinate.encoder_health !=
+                        Domain::Localization::SensorHealth::Failed &&
+                    coordinate.imu_health !=
+                        Domain::Localization::SensorHealth::Failed;
+
+                if (!has_coordinate) {
                     scale = 0.0f;
-                } else if (coordinate.fusion_quality ==
-                           Domain::Fusion::Quality::Degraded) {
-                    scale = 0.5f;
+                    hold_reason = NavHoldReason::CoordinateUnavailable;
+                } else if (!position_usable) {
+                    scale = 0.0f;
+                    hold_reason = NavHoldReason::PositionUnusable;
+                } else if (!yaw_usable ||
+                           coordinate.localization_quality ==
+                               Domain::Localization::Quality::Failed) {
+                    scale = 0.0f;
+                    hold_reason = !yaw_usable
+                        ? NavHoldReason::YawUnusable
+                        : NavHoldReason::LocalizationFailed;
+                } else if (only_magnetic_unhealthy) {
+                    // Magnetic-only degradation must not create the low-speed
+                    // loop that prevents a fresh GPS course measurement.
+                    scale = 1.0f;
+                } else if (coordinate.localization_quality ==
+                           Domain::Localization::Quality::Degraded) {
+                    scale = 0.75f;
+                } else if (coordinate.localization_quality ==
+                           Domain::Localization::Quality::Unreliable) {
+                    scale = 0.60f;
                 }
             } else if (
                 request.source ==
-                    MotionCommandSource::CameraNavigation &&
-                (!has_coordinate ||
-                 coordinate.imu_health ==
-                    Domain::Fusion::SensorHealth::Failed)) {
-                scale = 0.0f;
+                    MotionCommandSource::NavigationRecovery) {
+                SystemData system{};
+                const bool recovery_allowed =
+                    xQueuePeek(mbx_system_data, &system, 0) == pdTRUE &&
+                    system.state == SystemState::STATE_GPS_NAV;
+                if (!recovery_allowed) {
+                    scale = 0.0f;
+                    hold_reason = NavHoldReason::ArbiterSafety;
+                }
             }
 
-            jog.velocity_mm_s = static_cast<float>(clampInt16(
-                static_cast<int16_t>(lroundf(
-                    request.velocity_mm_s * scale)),
-                -MAX_VELOCITY_MM_S,
-                MAX_VELOCITY_MM_S));
+            int16_t scaled_velocity = static_cast<int16_t>(lroundf(
+                request.velocity_mm_s * scale));
+            if (request.source == MotionCommandSource::GpsNavigation &&
+                scale > 0.0f && request.velocity_mm_s != 0 &&
+                abs(scaled_velocity) < GPS_YAW_AIDING_MIN_COMMAND_MM_S) {
+                scaled_velocity = request.velocity_mm_s > 0
+                    ? GPS_YAW_AIDING_MIN_COMMAND_MM_S
+                    : -GPS_YAW_AIDING_MIN_COMMAND_MM_S;
+            }
+            const int16_t velocity_limit =
+                request.source == MotionCommandSource::NavigationRecovery
+                    ? RECOVERY_MAX_VELOCITY_MM_S
+                    : MAX_VELOCITY_MM_S;
+            scaled_velocity = clampInt16(
+                scaled_velocity,
+                static_cast<int16_t>(-velocity_limit),
+                velocity_limit);
+            jog.velocity_mm_s = static_cast<float>(scaled_velocity);
             jog.omega_rad_s =
                 static_cast<float>(clampInt16(
                     static_cast<int16_t>(lroundf(
@@ -113,6 +167,11 @@ void taskMotionArbiter(void* pvParameters)
                 request.source == MotionCommandSource::Manual
                     ? JogSource::Manual
                     : JogSource::Navigation;
+            jog.nav_hold_reason = hold_reason;
+            jog.recovery_phase = request.recovery_phase;
+            jog.navigation_reset_count = request.navigation_reset_count;
+            jog.jog_before_scale_mm_s = request.velocity_mm_s;
+            jog.jog_after_scale_mm_s = scaled_velocity;
         }
 
         // 候補がない場合もゼロを明示し、CAN側の停止を保証する。

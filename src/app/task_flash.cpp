@@ -275,8 +275,8 @@ void taskFlash(void *pvParameters)
                 latest_log.stuck_reason != 0 &&
                 (!have_saved_log ||
                  latest_log.stuck_reason != last_saved_log.stuck_reason ||
-                 latest_log.stuck_cell_x != last_saved_log.stuck_cell_x ||
-                 latest_log.stuck_cell_y != last_saved_log.stuck_cell_y);
+                 latest_log.stuck_verification_result !=
+                    last_saved_log.stuck_verification_result);
             const bool periodic_due =
                 static_cast<uint32_t>(now_ms - last_log_save_ms) >=
                     LOG_SAVE_PERIOD_MS;
@@ -288,7 +288,7 @@ void taskFlash(void *pvParameters)
                     last_log_save_ms = now_ms;
 
                     if (flash.isStorageFull()) {
-                        // 20480件目を保存した後は、このシーケンス中のLOG保存を止める。
+                        // 40960件目を保存した後は、このシーケンス中のLOG保存を止める。
                         led_event = FlashLedEvent::LogFileFull;
                         led_event_ms = now_ms;
                     } else {

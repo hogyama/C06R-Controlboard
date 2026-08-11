@@ -413,7 +413,7 @@ void SrvFlash::scanFiles()
         const uint32_t file_start =
             FILES_START_ADDRESS + static_cast<uint32_t>(file_idx) * FILE_SIZE;
 
-        // 各64KBブロックは先頭レコードから順番に使うため、先頭256Bを調べれば
+        // 各64KBブロックは先頭レコードから順番に使うため、先頭128Bを調べれば
         // 途中書込み・旧1MB形式・中断された消去も保守的に使用済み判定できる。
         bool region_has_data = false;
         bool first_record_read = false;

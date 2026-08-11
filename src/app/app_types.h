@@ -2,7 +2,7 @@
 #include <Arduino.h> 
 #include "service/Can/srv_can.h"
 #include "algorithm/astar.h"
-#include "domain/fusion/fusion_types.h"
+#include "domain/localization/localization_types.h"
 #include "domain/motion/motion_types.h"
 
 enum class SystemState : uint8_t {
@@ -56,6 +56,9 @@ enum class BootMode : uint8_t {
 struct SystemData{
     SystemState state;
     BootMode boot_mode;
+    // 試験時もGPS受信とログは継続し、Localizationへの観測入力だけを切り替える。
+    bool gps_localization_enabled = true;
+    uint16_t navigation_reset_count = 0;
 };
 
 
@@ -88,9 +91,13 @@ enum class SystemCmdType : uint8_t {
     LandingDetected,    
 
     // MANUAL Mode Command
-    ForceGpsNav, 
-    ForceCameraNav, 
-    ForceEscape
+    ForceGpsNav,
+    ForceCameraNav,
+    ForceEscape,
+    NavigationRecoveryReset,
+    DisableGpsLocalization,
+    EnableGpsLocalization,
+    MarkObstacle
 };
 
 enum class JogSource : uint8_t {
@@ -98,10 +105,31 @@ enum class JogSource : uint8_t {
     Manual
 };
 
+enum class NavHoldReason : uint8_t {
+    None = 0,
+    NoCommand,
+    CoordinateUnavailable,
+    PositionUnusable,
+    YawUnusable,
+    LocalizationFailed,
+    PathUnavailable,
+    GoalTransition,
+    ArbiterSafety,
+    RecoveryReset
+};
+
+enum class NavigationRecoveryPhase : uint8_t {
+    None = 0,
+    YawCourseAcquire,
+    AwaitFreshGps,
+    Stabilizing
+};
+
 // 候補指令はすべてArbiterへ送り、CAN用mailboxを直接上書きしない。
 enum class MotionCommandSource : uint8_t {
     Stop = 0,
     GpsNavigation,
+    NavigationRecovery,
     CameraNavigation,
     Escape,
     Manual,
@@ -115,6 +143,9 @@ struct MotionCommandRequest {
     int16_t omega_rad_s_x100;
     uint16_t duration_ms;
     uint32_t timestamp_ms;
+    NavHoldReason nav_hold_reason;
+    NavigationRecoveryPhase recovery_phase;
+    uint16_t navigation_reset_count;
 };
 
 struct JogData : public Can::Command::Velocity {
@@ -123,6 +154,11 @@ struct JogData : public Can::Command::Velocity {
 
     // EKFの状態と不確かさ。ログ側は推定器内部へ直接アクセスしない。
     JogSource source;
+    NavHoldReason nav_hold_reason;
+    NavigationRecoveryPhase recovery_phase;
+    uint16_t navigation_reset_count;
+    int16_t jog_before_scale_mm_s;
+    int16_t jog_after_scale_mm_s;
 };
 
 enum CordinateSourceFlag : uint8_t {
@@ -133,19 +169,11 @@ enum CordinateSourceFlag : uint8_t {
     CORD_SRC_HOLD    = 1 << 3,
 };
 
-enum class Attitude : uint8_t {
-    Normal = 0,
-    Flipped,
-    HighTilt,
-    Unknown
-};
-
 struct Coordinate {
     int32_t x_mm;
     int32_t y_mm;
     float heading_rad;      // rad, 東0度・反時計回り正
-    Attitude attitude;      // Normal, Flipped, HighTilt, Unknown
-    
+
     uint8_t source_flags;   // CordinateSourceFlagのbitflags
 
     int32_t gps_x_mm;          // mm, 東を0度として反時計回り正の角度とする座標系
@@ -160,16 +188,69 @@ struct Coordinate {
     float yaw_rate_rad_s;
     uint32_t position_std_mm;
     float yaw_std_rad;
-    uint16_t fusion_status_flags;
-    Domain::Fusion::Quality fusion_quality;
-    Domain::Fusion::SensorHealth gps_health;
-    Domain::Fusion::SensorHealth encoder_health;
-    Domain::Fusion::SensorHealth imu_health;
-    Domain::Fusion::SensorHealth magnetic_health;
+    uint16_t localization_status_flags;
+    Domain::Localization::Quality localization_quality;
+    Domain::Localization::SensorHealth gps_health;
+    Domain::Localization::SensorHealth encoder_health;
+    Domain::Localization::SensorHealth imu_health;
+    Domain::Localization::SensorHealth magnetic_health;
+    uint32_t yaw_aiding_age_ms;
+    Domain::Localization::MagneticRejectReason magnetic_reject_reason;
+    float magnetic_total_uT;
+    float magnetic_nis;
+    Domain::Localization::GpsCourseRejectReason gps_course_reject_reason;
     uint16_t motion_anomaly_flags;
     uint32_t motion_anomaly_since_ms;
 
     bool is_first_gps_valid; // 最初にGPSが有効にならないと、ゴールとの位置関係が全く分からないため
+};
+
+enum class LocalizationDebugCommand : uint8_t {
+    None = 0,
+    CalibrateGyroBias,
+    CalibrateMagnetic,
+    ResetMagneticCalibration
+};
+
+struct DebugSensorStatus {
+    Domain::Localization::SensorHealth board_health;
+    Domain::Localization::SensorHealth can_health;
+    Sensor::Source active_source;
+    float board_rate_hz;
+    float can_rate_hz;
+};
+
+struct LocalizationDebugStatus {
+    DebugSensorStatus gyroscope;
+    DebugSensorStatus accelerometer;
+    DebugSensorStatus magnetic;
+    Domain::Localization::SensorHealth encoder_health;
+    Domain::Localization::SensorHealth gps_health;
+    Domain::Localization::SensorHealth pressure_health;
+    float encoder_rate_hz;
+    float gps_rate_hz;
+    float pressure_rate_hz;
+
+    float gyro_bias_z_rad_s;
+    float gyro_bias_std_rad_s;
+    float gyro_bias_max_deviation_rad_s;
+    uint32_t gyro_bias_samples;
+    uint32_t gyro_bias_generation;
+    bool gyro_bias_calibrating;
+    bool gyro_bias_last_success;
+
+    float magnetic_hard_iron_uT[3];
+    float magnetic_soft_iron[3][3];
+    float magnetic_calibration_rms_uT;
+    uint32_t magnetic_calibration_samples;
+    uint32_t magnetic_calibration_generation;
+    uint32_t magnetic_reset_generation;
+    uint16_t magnetic_calibration_target_samples;
+    uint8_t magnetic_calibration_result;
+    bool magnetic_calibrating;
+    bool magnetic_calibration_last_success;
+    bool magnetic_calibration_valid;
+    uint64_t timestamp_us;
 };
 
 // taskStuckからtaskNavへ渡す地図更新要求
@@ -208,7 +289,7 @@ struct StuckDiagnostics {
     Domain::Motion::StuckScores scores;
     uint8_t verification_phase;
     StuckReason trigger_reason;
-    uint8_t recurrence_count[4];
+    uint8_t recurrence_count[3];
     uint8_t verification_attempt;
     uint8_t verification_stuck_votes;
     uint8_t verification_result; // 0:none, 1:stuck, 2:moved, 3:inconclusive
@@ -218,11 +299,14 @@ struct StuckDiagnostics {
     int16_t probe_left_delta_mm;
     int16_t probe_right_delta_mm;
     int16_t probe_gyro_angle_mrad;
-    uint16_t tilt_deg_x10;
     uint16_t gps_window_age_ms;
-    uint16_t gps_max_radius_mm;
+    uint16_t gps_displacement_mm;
     uint16_t gps_encoder_distance_mm;
     uint8_t gps_sample_count;
+    uint8_t gps_speed_mismatch_count;
+    uint16_t wheel_blocked_active_ms;
+    uint16_t wheel_slip_active_ms;
+    uint16_t rotation_blocked_active_ms;
     int16_t encoder_left_velocity_mm_s;
     int16_t encoder_right_velocity_mm_s;
 };

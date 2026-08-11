@@ -1,5 +1,24 @@
 #include "srv_gps.h"
 
+#include <esp_timer.h>
+
+namespace {
+
+uint32_t receivedAgeMs(
+    const Gps::NavPvtObservation& observation,
+    uint64_t now_us)
+{
+    if (observation.metadata.received_us == 0U ||
+        now_us < observation.metadata.received_us) {
+        return UINT32_MAX;
+    }
+    const uint64_t age_ms =
+        (now_us - observation.metadata.received_us) / 1000ULL;
+    return age_ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(age_ms);
+}
+
+} // namespace
+
 SrvGps::SrvGps()
     : is_gps_initialized(false),
       gps_power_on(false),
@@ -11,8 +30,6 @@ SrvGps::SrvGps()
       uart_active(false),
       status(Status::Dead),
       is_valid(false),
-      last_rx_time(0),
-      last_passed_sentences(0),
       ubx_state(UbxParseState::Sync1),
       ubx_class(0),
       ubx_id(0),
@@ -21,8 +38,6 @@ SrvGps::SrvGps()
       ubx_checksum_a(0),
       ubx_checksum_b(0),
       ubx_received_checksum_a(0),
-      nmea_observation{},
-      nmea_observation_available(false),
       nav_pvt_observation{},
       nav_pvt_observation_available(false),
       ubx_configuration_sent(false),
@@ -30,7 +45,7 @@ SrvGps::SrvGps()
       last_ubx_configuration_ms(0),
       navigation_time_reference_valid(false),
       previous_navigation_itow_ms(0),
-      previous_navigation_timestamp_ms(0)
+       previous_navigation_timestamp_us(0)
 {
 }
 
@@ -131,18 +146,14 @@ bool SrvGps::powerOn()
     gps_power_on = true;
     is_valid = false;
     status = Status::Searching;
-    nmea_observation = {};
-    nmea_observation_available = false;
     nav_pvt_observation = {};
     nav_pvt_observation_available = false;
     ubx_configuration_sent = false;
     gps_power_on_time_ms = millis();
-    last_rx_time = 0;
-    last_passed_sentences = gps.passedChecksum();
     last_ubx_configuration_ms = 0;
     navigation_time_reference_valid = false;
     previous_navigation_itow_ms = 0;
-    previous_navigation_timestamp_ms = 0;
+    previous_navigation_timestamp_us = 0;
     resetUbxParser();
     return true;
 }   
@@ -156,13 +167,12 @@ void SrvGps::powerOff()
     digitalWrite(gps_enable_pin, LOW);
     gps_power_on = false;
     is_valid = false;
-    nmea_observation_available = false;
     nav_pvt_observation_available = false;
     ubx_configuration_sent = false;
     last_ubx_configuration_ms = 0;
     navigation_time_reference_valid = false;
     previous_navigation_itow_ms = 0;
-    previous_navigation_timestamp_ms = 0;
+    previous_navigation_timestamp_us = 0;
     status = Status::Dead;
 }
 
@@ -175,12 +185,12 @@ void SrvGps::poll()
     }
 
     // MAX-M10Sの起動完了を待ち、RAM設定だけを毎回適用する。
-    // NMEA出力は残したまま、同じUARTへUBX-NAV-PVTを追加する。
+    // UART出力をUBX-NAV-PVTだけに設定する。
     const uint32_t now_ms = millis();
+    const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
     const bool nav_pvt_missing_or_stale =
         !nav_pvt_observation_available ||
-        static_cast<uint32_t>(
-            now_ms - nav_pvt_observation.received_ms) >= VALID_TIMEOUT_MS;
+        receivedAgeMs(nav_pvt_observation, now_us) >= VALID_TIMEOUT_MS;
     const bool configuration_retry_due =
         nav_pvt_missing_or_stale &&
         (last_ubx_configuration_ms == 0U ||
@@ -193,86 +203,33 @@ void SrvGps::poll()
 
     uint8_t gps_buffer[128];
     while (true) {
-        int len = uart_read_bytes(uart_num, gps_buffer, sizeof(gps_buffer), 0);
+        const int len = uart_read_bytes(
+            uart_num, gps_buffer, sizeof(gps_buffer), 0);
         if (len <= 0) {
             break; // 読み切ったのでループを抜ける
         }
         for (int i = 0; i < len; i++) {
-            gps.encode(gps_buffer[i]);
             parseUbxByte(gps_buffer[i]);
         }
     }
+    const uint64_t status_now_us =
+        static_cast<uint64_t>(esp_timer_get_time());
     is_valid =
         nav_pvt_observation_available &&
         nav_pvt_observation.fix_ok &&
-        static_cast<uint32_t>(now_ms - nav_pvt_observation.received_ms) <=
-            VALID_TIMEOUT_MS;
+        receivedAgeMs(nav_pvt_observation, status_now_us) <= VALID_TIMEOUT_MS;
 
-    uint32_t current_sentences = gps.passedChecksum();
-    if (current_sentences > last_passed_sentences) {
-        last_passed_sentences = current_sentences;
-        last_rx_time = now_ms;
-        nmea_observation.sentence_timestamp_ms = now_ms;
-        nmea_observation_available = true;
-    }
-    if (gps.location.isUpdated()) {
-        nmea_observation.location_timestamp_ms = now_ms;
-        nmea_observation.location_valid = gps.location.isValid();
-        if (nmea_observation.location_valid) {
-            nmea_observation.latitude_e7 = static_cast<int32_t>(
-                llround(gps.location.lat() * 10000000.0));
-            nmea_observation.longitude_e7 = static_cast<int32_t>(
-                llround(gps.location.lng() * 10000000.0));
-        }
-        nmea_observation_available = true;
-    }
-    if (gps.satellites.isUpdated()) {
-        nmea_observation.satellites_timestamp_ms = now_ms;
-        nmea_observation.satellites_valid = gps.satellites.isValid();
-        if (nmea_observation.satellites_valid) {
-            const uint32_t satellites = gps.satellites.value();
-            nmea_observation.satellites = satellites > UINT8_MAX
-                ? UINT8_MAX : static_cast<uint8_t>(satellites);
-        }
-        nmea_observation_available = true;
-    }
-    if (gps.hdop.isUpdated()) {
-        nmea_observation.hdop_valid = gps.hdop.isValid();
-        if (nmea_observation.hdop_valid) {
-            const uint32_t hdop = gps.hdop.value();
-            nmea_observation.hdop_x100 = hdop > UINT16_MAX
-                ? UINT16_MAX : static_cast<uint16_t>(hdop);
-        }
-        nmea_observation_available = true;
-    }
     // ステータスの更新
-    const bool nmea_fresh =
-        last_rx_time != 0U &&
-        static_cast<uint32_t>(now_ms - last_rx_time) < SENTENCE_TIMEOUT_MS;
     const bool nav_pvt_fresh =
         nav_pvt_observation_available &&
-        static_cast<uint32_t>(
-            now_ms - nav_pvt_observation.received_ms) < VALID_TIMEOUT_MS;
-    // NMEAまたはNAV-PVTのどちらかが届いていればUART通信は生存している。
-    if (!nmea_fresh && !nav_pvt_fresh) {
+        receivedAgeMs(nav_pvt_observation, status_now_us) < VALID_TIMEOUT_MS;
+    if (!nav_pvt_fresh) {
         status = Status::Dead;
     } else if (is_valid) {
         status = Status::Fix;
     } else {
         status = Status::Searching;
     }
-}
-
-bool SrvGps::getNmeaObservation(Gps::NmeaObservation* observation_out) const
-{
-    if (observation_out == nullptr ||
-        !is_gps_initialized ||
-        !gps_power_on ||
-        !nmea_observation_available) {
-        return false;
-    }
-    *observation_out = nmea_observation;
-    return true;
 }
 
 bool SrvGps::getNavPvtObservation(
@@ -401,12 +358,13 @@ void SrvGps::handleUbxFrame()
     const uint8_t fix_type = ubx_payload[20];
     const uint8_t flags = ubx_payload[21];
 
-    const uint32_t arrival_timestamp_ms = millis();
+    const uint64_t arrival_timestamp_us =
+        static_cast<uint64_t>(esp_timer_get_time());
     const uint32_t navigation_itow_ms =
         readLittleEndian<uint32_t>(&ubx_payload[0]);
-    uint32_t navigation_timestamp_ms =
-        arrival_timestamp_ms > NAV_PVT_TRANSPORT_DELAY_MS
-            ? arrival_timestamp_ms - NAV_PVT_TRANSPORT_DELAY_MS
+    uint64_t navigation_timestamp_us =
+        arrival_timestamp_us > NAV_PVT_TRANSPORT_DELAY_MS * 1000ULL
+            ? arrival_timestamp_us - NAV_PVT_TRANSPORT_DELAY_MS * 1000ULL
             : 1U;
 
     if (navigation_time_reference_valid) {
@@ -421,24 +379,26 @@ void SrvGps::handleUbxFrame()
         }
 
         if (itow_delta_ms > 0 && itow_delta_ms <= 2000) {
-            const uint32_t predicted_timestamp_ms =
-                previous_navigation_timestamp_ms +
-                static_cast<uint32_t>(itow_delta_ms);
-            const int32_t anchor_error_ms = static_cast<int32_t>(
-                navigation_timestamp_ms - predicted_timestamp_ms);
-            if (anchor_error_ms >= -500 && anchor_error_ms <= 500) {
+            const uint64_t predicted_timestamp_us =
+                previous_navigation_timestamp_us +
+                static_cast<uint64_t>(itow_delta_ms) * 1000ULL;
+            const int64_t anchor_error_us =
+                static_cast<int64_t>(navigation_timestamp_us) -
+                static_cast<int64_t>(predicted_timestamp_us);
+            if (anchor_error_us >= -500000 && anchor_error_us <= 500000) {
                 // Preserve the GNSS navigation interval and remove task/UART
                 // scheduling jitter from the measurement time.
-                navigation_timestamp_ms = predicted_timestamp_ms;
+                navigation_timestamp_us = predicted_timestamp_us;
             }
         }
     }
 
     navigation_time_reference_valid = true;
     previous_navigation_itow_ms = navigation_itow_ms;
-    previous_navigation_timestamp_ms = navigation_timestamp_ms;
-    nav_pvt_observation.timestamp_ms = navigation_timestamp_ms;
-    nav_pvt_observation.received_ms = arrival_timestamp_ms;
+    previous_navigation_timestamp_us = navigation_timestamp_us;
+    nav_pvt_observation.metadata.timestamp_us = navigation_timestamp_us;
+    nav_pvt_observation.metadata.received_us = arrival_timestamp_us;
+    nav_pvt_observation.metadata.source = Sensor::Source::Gps;
     nav_pvt_observation.longitude_e7 =
         readLittleEndian<int32_t>(&ubx_payload[24]);
     nav_pvt_observation.latitude_e7 =
@@ -455,6 +415,7 @@ void SrvGps::handleUbxFrame()
         readLittleEndian<uint32_t>(&ubx_payload[68]);
     nav_pvt_observation.fix_ok =
         (flags & 0x01U) != 0U && fix_type >= 2U;
+    nav_pvt_observation.metadata.valid = nav_pvt_observation.fix_ok;
     nav_pvt_observation_available = true;
 }
 
@@ -499,10 +460,13 @@ bool SrvGps::configureMaxM10s()
 {
     // UBX-CFG-VALSET version 0、RAM layer。
     // CFG-UART1OUTPROT-UBX  = true
-    // CFG-UART1OUTPROT-NMEA = true
+    // CFG-UART1OUTPROT-NMEA = false
     // CFG-MSGOUT-UBX_NAV_PVT_UART1 = every navigation solution
     constexpr uint32_t KEY_UART1_OUT_UBX = 0x10740001UL;
     constexpr uint32_t KEY_UART1_OUT_NMEA = 0x10740002UL;
+    // 地上を低速走行するCanSatに合わせ、測位フィルタを歩行者モデルにする。
+    constexpr uint32_t KEY_NAVSPG_DYNMODEL = 0x20110021UL;
+    constexpr uint8_t DYNMODEL_PEDESTRIAN = 3U;
     constexpr uint32_t KEY_NAV_PVT_UART1 = 0x20910007UL;
     constexpr uint32_t KEY_NMEA_GGA_UART1 = 0x209100BBUL;
     constexpr uint32_t KEY_NMEA_GLL_UART1 = 0x209100CAUL;
@@ -511,8 +475,8 @@ bool SrvGps::configureMaxM10s()
     constexpr uint32_t KEY_NMEA_RMC_UART1 = 0x209100ACUL;
     constexpr uint32_t KEY_NMEA_VTG_UART1 = 0x209100B1UL;
 
-    // 9600 baudでもNAV-PVTと共存できるよう、NMEAはGGAとRMCに絞る。
-    uint8_t payload[49]{};
+    // NMEA各メッセージも明示的に無効化する。
+    uint8_t payload[54]{};
     payload[0] = 0x00; // version
     payload[1] = 0x01; // RAM layer
 
@@ -523,13 +487,14 @@ bool SrvGps::configureMaxM10s()
         payload[offset++] = value;
     };
     appendU1(KEY_UART1_OUT_UBX, 1);
-    appendU1(KEY_UART1_OUT_NMEA, 1);
+    appendU1(KEY_UART1_OUT_NMEA, 0);
+    appendU1(KEY_NAVSPG_DYNMODEL, DYNMODEL_PEDESTRIAN);
     appendU1(KEY_NAV_PVT_UART1, 1);
-    appendU1(KEY_NMEA_GGA_UART1, 1);
+    appendU1(KEY_NMEA_GGA_UART1, 0);
     appendU1(KEY_NMEA_GLL_UART1, 0);
     appendU1(KEY_NMEA_GSA_UART1, 0);
     appendU1(KEY_NMEA_GSV_UART1, 0);
-    appendU1(KEY_NMEA_RMC_UART1, 1);
+    appendU1(KEY_NMEA_RMC_UART1, 0);
     appendU1(KEY_NMEA_VTG_UART1, 0);
 
     return offset == sizeof(payload) &&
