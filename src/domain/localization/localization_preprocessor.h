@@ -14,6 +14,15 @@ struct MagneticCalibration {
     bool valid = false;
 };
 
+struct MagneticDiagnostic {
+    float corrected_uT[3]{};
+    float heading_rad = 0.0f;
+    float field_strength_uT = 0.0f;
+    bool vector_valid = false;
+    bool heading_valid = false;
+    bool calibration_applied = false;
+};
+
 class GyroIntervalIntegrator {
 public:
     void reset(uint64_t start_timestamp_us = 0);
@@ -43,6 +52,8 @@ public:
     EncoderVelocityObservation processEncoder(
         const EncoderObservation& observation);
     void updateAcceleration(const Sensor::AccelerometerData& acceleration_body);
+    MagneticDiagnostic magneticDiagnostic(
+        const Sensor::MagneticData& magnetic_body) const;
     MagneticHeadingObservation processMagnetic(
         const Sensor::MagneticData& magnetic_body);
     StationaryObservation stationaryObservation(

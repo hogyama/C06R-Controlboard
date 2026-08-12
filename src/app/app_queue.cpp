@@ -100,7 +100,7 @@ bool appInitQueues() {
         1, sizeof(LocalizationDebugStatus));
     mbx_navigation_progress =
         xQueueCreate(1, sizeof(NavigationProgress));
-    mbx_twe_telemetry = xQueueCreate(1, sizeof(Twe::TelemetryFrame));
+    mbx_twe_telemetry = xQueueCreate(1, sizeof(Twe::TelemetrySnapshot));
     mbx_camera_data = xQueueCreate(1, sizeof(Rasp::CameraData));
     mbx_flash_log = xQueueCreate(1, sizeof(Flash::LogFrame));
     mbx_stuck_status = xQueueCreate(1, sizeof(StuckStatus));

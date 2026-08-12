@@ -184,6 +184,115 @@ bool Ekf5::updateEncoderVelocity(
         residual, jacobian, variance, 1, config_.mahalanobis_gate_1d);
 }
 
+bool Ekf5::predictOdometry(
+    uint64_t end_timestamp_us,
+    float distance_m,
+    float delta_yaw_rad,
+    float distance_variance_m2,
+    float yaw_variance_rad2,
+    bool distance_from_velocity)
+{
+    if (!initialized_ || end_timestamp_us <= timestamp_us_ ||
+        !isfinite(distance_m) || !isfinite(delta_yaw_rad)) return false;
+    const float dt = static_cast<float>(end_timestamp_us - timestamp_us_) *
+        1.0e-6f;
+    if (!(dt > 0.0f) || dt > 2.0f) return false;
+
+    const float midpoint_yaw = state_[YAW] + 0.5f * delta_yaw_rad;
+    const float cosine = cosf(midpoint_yaw);
+    const float sine = sinf(midpoint_yaw);
+    float jacobian[STATE_COUNT][STATE_COUNT]{};
+    for (uint8_t i = 0; i < STATE_COUNT; ++i) jacobian[i][i] = 1.0f;
+    jacobian[POSITION_X][YAW] = -distance_m * sine;
+    jacobian[POSITION_Y][YAW] = distance_m * cosine;
+    if (distance_from_velocity) {
+        jacobian[POSITION_X][FORWARD_VELOCITY] = dt * cosine;
+        jacobian[POSITION_Y][FORWARD_VELOCITY] = dt * sine;
+    }
+
+    float temporary[STATE_COUNT][STATE_COUNT]{};
+    float predicted[STATE_COUNT][STATE_COUNT]{};
+    for (uint8_t row = 0; row < STATE_COUNT; ++row) {
+        for (uint8_t column = 0; column < STATE_COUNT; ++column) {
+            for (uint8_t k = 0; k < STATE_COUNT; ++k) {
+                temporary[row][column] +=
+                    jacobian[row][k] * covariance_[k][column];
+            }
+        }
+    }
+    for (uint8_t row = 0; row < STATE_COUNT; ++row) {
+        for (uint8_t column = 0; column < STATE_COUNT; ++column) {
+            for (uint8_t k = 0; k < STATE_COUNT; ++k) {
+                predicted[row][column] +=
+                    temporary[row][k] * jacobian[column][k];
+            }
+        }
+    }
+
+    const float distance_variance = fmaxf(
+        distance_variance_m2,
+        fmaxf(config_.distance_noise_m2_s, 0.0f) * dt);
+    const float angle_variance = fmaxf(
+        yaw_variance_rad2,
+        fmaxf(config_.angle_noise_rad2_s, 0.0f) * dt);
+    const float distance_map[STATE_COUNT] = {cosine, sine, 0.0f, 0.0f, 0.0f};
+    const float angle_map[STATE_COUNT] = {
+        -0.5f * distance_m * sine,
+        0.5f * distance_m * cosine,
+        1.0f,
+        0.0f,
+        0.0f};
+    for (uint8_t row = 0; row < STATE_COUNT; ++row) {
+        for (uint8_t column = 0; column < STATE_COUNT; ++column) {
+            predicted[row][column] +=
+                distance_map[row] * distance_variance * distance_map[column] +
+                angle_map[row] * angle_variance * angle_map[column];
+        }
+    }
+    predicted[FORWARD_VELOCITY][FORWARD_VELOCITY] +=
+        fmaxf(config_.velocity_noise_m2_s3, 0.0f) * dt;
+    predicted[GYRO_BIAS_Z][GYRO_BIAS_Z] +=
+        fmaxf(config_.gyro_bias_noise_rad2_s3, 0.0f) * dt;
+
+    state_[POSITION_X] += distance_m * cosine;
+    state_[POSITION_Y] += distance_m * sine;
+    state_[YAW] = wrapPi(state_[YAW] + delta_yaw_rad);
+    memcpy(covariance_, predicted, sizeof(covariance_));
+    timestamp_us_ = end_timestamp_us;
+    stabilizeCovariance();
+    return covariance_valid_;
+}
+
+bool Ekf5::predictEncoderMotion(
+    const EncoderVelocityObservation& observation)
+{
+    if (!observation.valid || observation.interval_us == 0U ||
+        observation.metadata.timestamp_us <= timestamp_us_) return false;
+    const float distance_std = config_.encoder_velocity_std_m_s *
+        static_cast<float>(observation.interval_us) * 1.0e-6f;
+    return predictOdometry(
+        observation.metadata.timestamp_us,
+        observation.delta_distance_m,
+        observation.delta_yaw_rad,
+        distance_std * distance_std,
+        observation.yaw_variance_rad2,
+        false);
+}
+
+bool Ekf5::predictCoast(uint64_t end_timestamp_us)
+{
+    if (!initialized_ || end_timestamp_us <= timestamp_us_) return false;
+    const float dt = static_cast<float>(end_timestamp_us - timestamp_us_) *
+        1.0e-6f;
+    return predictOdometry(
+        end_timestamp_us,
+        state_[FORWARD_VELOCITY] * dt,
+        0.0f,
+        fmaxf(config_.distance_noise_m2_s, 0.0f) * dt * 4.0f,
+        fmaxf(config_.angle_noise_rad2_s, 0.0f) * dt * 4.0f,
+        true);
+}
+
 bool Ekf5::updateMagneticHeading(
     const MagneticHeadingObservation& observation)
 {
@@ -291,6 +400,25 @@ bool Ekf5::setGyroBias(float bias_rad_s, float variance_rad2_s2)
     return covariance_valid_;
 }
 
+bool Ekf5::shiftPosition(
+    float east_m,
+    float north_m,
+    float position_std_m)
+{
+    if (!initialized_ || !isfinite(east_m) || !isfinite(north_m) ||
+        !isfinite(position_std_m)) return false;
+    state_[POSITION_X] += east_m;
+    state_[POSITION_Y] += north_m;
+    const float variance = square(fmaxf(
+        position_std_m, config_.gps_position_noise_floor_m));
+    covariance_[POSITION_X][POSITION_X] = variance;
+    covariance_[POSITION_Y][POSITION_Y] = variance;
+    covariance_[POSITION_X][POSITION_Y] = 0.0f;
+    covariance_[POSITION_Y][POSITION_X] = 0.0f;
+    stabilizeCovariance();
+    return covariance_valid_;
+}
+
 Ekf5::Snapshot Ekf5::snapshot() const
 {
     Snapshot result{};
@@ -365,7 +493,12 @@ bool Ekf5::measurementUpdate(
                 residual[row] * inverse[row][column] * residual[column];
         }
     }
-    if (!isfinite(last_mahalanobis_) || last_mahalanobis_ > gate) return false;
+    if (!isfinite(last_mahalanobis_) || last_mahalanobis_ > gate * 4.0f) {
+        return false;
+    }
+    const float robust_residual_scale = last_mahalanobis_ > gate
+        ? sqrtf(gate / last_mahalanobis_)
+        : 1.0f;
 
     float gain[STATE_COUNT][2]{};
     for (uint8_t state = 0; state < STATE_COUNT; ++state) {
@@ -381,7 +514,8 @@ bool Ekf5::measurementUpdate(
     }
     for (uint8_t state = 0; state < STATE_COUNT; ++state) {
         for (uint8_t measurement = 0; measurement < dimension; ++measurement) {
-            state_[state] += gain[state][measurement] * residual[measurement];
+            state_[state] += gain[state][measurement] *
+                residual[measurement] * robust_residual_scale;
         }
     }
     state_[YAW] = wrapPi(state_[YAW]);

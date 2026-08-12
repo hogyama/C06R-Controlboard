@@ -27,10 +27,13 @@ constexpr float GPS_BASE_SPEED_MM_S = 700.0f;
 constexpr float GPS_MIN_SPEED_MM_S = 500.0f;
 constexpr float GPS_MAX_SPEED_MM_S = 850.0f;
 constexpr float YAW_RECOVERY_SPEED_MM_S = 450.0f;
-constexpr uint32_t PERMANENT_ZERO_JOG_TIMEOUT_MS = 3000;
-constexpr uint32_t YAW_ACQUIRE_BEFORE_RESET_MS = 6000;
+constexpr uint32_t YAW_ACQUIRE_DRIVE_MS = 1500;
+constexpr uint32_t YAW_ACQUIRE_RETRY_WAIT_MS = 2000;
+constexpr uint8_t YAW_ACQUIRE_MAX_ATTEMPTS = 2;
 constexpr uint32_t YAW_RESET_RETRY_MS = 10000;
 constexpr uint32_t YAW_RECOVERY_STABILIZE_MS = 1000;
+constexpr uint32_t GPS_WARP_STABILIZE_MS = 1000;
+constexpr float GPS_WARP_STABILIZE_SPEED_MM_S = 450.0f;
 
 // 急旋回時の過大な角速度を抑え、経路追従の行き過ぎを防ぐ。
 constexpr float GPS_MAX_TURN_RATE_RAD_S = 3.0f;
@@ -52,6 +55,7 @@ MotionCommandSource active_command_source =
 NavigationRecoveryPhase active_recovery_phase =
     NavigationRecoveryPhase::None;
 uint16_t active_navigation_reset_count = 0;
+PathMode active_path_mode = PathMode::None;
 
 /**
  * Jog送信関数
@@ -142,7 +146,30 @@ void driveTowardNearestFieldPoint(const Coordinate& coordinate)
         heading_error_rad * FIELD_RECOVERY_HEADING_KP,
         -GPS_MAX_TURN_RATE_RAD_S,
         GPS_MAX_TURN_RATE_RAD_S);
-    publishJog(GPS_MIN_SPEED_MM_S, omega_rad_s);
+    publishJog(GPS_BASE_SPEED_MM_S, omega_rad_s);
+}
+
+void driveDirectlyToward(
+    const Coordinate& coordinate,
+    float target_x_mm,
+    float target_y_mm,
+    float speed_mm_s = GPS_BASE_SPEED_MM_S)
+{
+    const float heading = atan2f(
+        target_y_mm - static_cast<float>(coordinate.y_mm),
+        target_x_mm - static_cast<float>(coordinate.x_mm));
+    const float error = PurePursuit::normalizeAngleRad(
+        heading - coordinate.heading_rad);
+    if (fabsf(error) > 45.0f * (M_PI / 180.0f)) {
+        publishJog(0.0f, error >= 0.0f
+            ? GPS_MAX_TURN_RATE_RAD_S : -GPS_MAX_TURN_RATE_RAD_S);
+        return;
+    }
+    publishJog(
+        speed_mm_s,
+        clampFloat(error * 2.0f,
+            -GPS_MAX_TURN_RATE_RAD_S,
+            GPS_MAX_TURN_RATE_RAD_S));
 }
 
 void publishNavigationProgress(
@@ -153,6 +180,7 @@ void publishNavigationProgress(
     NavigationProgress progress{};
     progress.timestamp_ms = timestamp_ms;
     progress.path_revision = path_revision;
+    progress.path_mode = active_path_mode;
     if (output != nullptr) {
         progress.nearest_index = output->nearest_index;
         progress.target_index = output->target_index;
@@ -245,6 +273,9 @@ void taskNav(void *pvParameters)
     pp_config.wheel_base_mm = ROBOT_TRACK_WIDTH_MM;
 
     bool path_valid = false;
+    bool path_chunked = false;
+    bool direct_path_fallback = false;
+    uint8_t pure_pursuit_invalid_count = 0;
     bool field_recovery_active = false;
     uint32_t planned_map_update_count = 0;
     uint32_t last_replan_ms = 0;
@@ -254,7 +285,9 @@ void taskNav(void *pvParameters)
     NavHoldReason recovery_reason = NavHoldReason::None;
     uint32_t recovery_phase_started_ms = 0;
     uint32_t last_navigation_reset_request_ms = 0;
-    uint32_t zero_jog_started_ms = 0;
+    uint8_t yaw_acquire_attempts = 0;
+    uint32_t observed_gps_warp_count = 0;
+    uint32_t gps_warp_stabilize_until_ms = 0;
     AStar::GridPos last_traversed_cell{};
     bool have_last_traversed_cell = false;
 
@@ -341,8 +374,9 @@ void taskNav(void *pvParameters)
             recovery_reason = NavHoldReason::None;
             recovery_phase_started_ms = 0;
             last_navigation_reset_request_ms = 0;
-            zero_jog_started_ms = 0;
+            yaw_acquire_attempts = 0;
             active_recovery_phase = NavigationRecoveryPhase::None;
+            active_path_mode = PathMode::None;
 
             if (status.state == SystemState::STATE_CAMERA_NAV) {
                 CameraNavigation::reset();
@@ -374,33 +408,38 @@ void taskNav(void *pvParameters)
             const bool coordinate_usable =
                 coordinate_fresh && position_usable && yaw_usable &&
                 coordinate.is_first_gps_valid;
-
-            JogData active_jog{};
-            const bool active_jog_valid =
-                xQueuePeek(mbx_can_jog_cmd, &active_jog, 0) == pdTRUE &&
-                static_cast<uint32_t>(
-                    now_ms - active_jog.timestamp_ms) <
-                    active_jog.duration_ms;
-            const bool jog_is_zero = !active_jog_valid ||
-                (fabsf(active_jog.velocity_mm_s) < 1.0f &&
-                 fabsf(active_jog.omega_rad_s) < 0.01f);
-            if (jog_is_zero) {
-                if (zero_jog_started_ms == 0U) {
-                    zero_jog_started_ms = now_ms;
-                }
-            } else {
-                zero_jog_started_ms = 0U;
+            if (has_coordinate &&
+                coordinate.gps_warp_count != observed_gps_warp_count) {
+                observed_gps_warp_count = coordinate.gps_warp_count;
+                gps_warp_stabilize_until_ms =
+                    now_ms + GPS_WARP_STABILIZE_MS;
+                path_valid = false;
+                pp_state = PurePursuit::PathState{};
+                last_replan_ms = now_ms - REPLAN_RETRY_MS;
             }
-            const bool zero_jog_watchdog_expired =
-                zero_jog_started_ms != 0U &&
-                static_cast<uint32_t>(
-                    now_ms - zero_jog_started_ms) >=
-                    PERMANENT_ZERO_JOG_TIMEOUT_MS;
+            const bool gps_warp_stabilizing =
+                static_cast<int32_t>(
+                    now_ms - gps_warp_stabilize_until_ms) < 0;
+
+            const bool yaw_course_acquire_allowed =
+                coordinate_fresh && position_usable && !yaw_usable &&
+                coordinate.is_first_gps_valid &&
+                coordinate.gps_health !=
+                    Domain::Localization::SensorHealth::Failed &&
+                coordinate.imu_health ==
+                    Domain::Localization::SensorHealth::Failed &&
+                coordinate.encoder_health ==
+                    Domain::Localization::SensorHealth::Failed &&
+                coordinate.magnetic_health ==
+                    Domain::Localization::SensorHealth::Failed;
 
             if (recovery_phase == NavigationRecoveryPhase::None &&
-                (!coordinate_usable || zero_jog_watchdog_expired)) {
-                recovery_phase =
-                    NavigationRecoveryPhase::YawCourseAcquire;
+                !coordinate_usable) {
+                active_path_mode = PathMode::None;
+                recovery_phase = yaw_course_acquire_allowed &&
+                        yaw_acquire_attempts < YAW_ACQUIRE_MAX_ATTEMPTS
+                    ? NavigationRecoveryPhase::YawCourseAcquire
+                    : NavigationRecoveryPhase::AwaitFreshGps;
                 recovery_phase_started_ms = now_ms;
                 path_valid = false;
                 if (!has_coordinate || !coordinate_fresh) {
@@ -410,9 +449,7 @@ void taskNav(void *pvParameters)
                     recovery_reason = NavHoldReason::PositionUnusable;
                 } else if (!yaw_usable) {
                     recovery_reason = NavHoldReason::YawUnusable;
-                } else {
-                    recovery_reason = NavHoldReason::NoCommand;
-                }
+                } else recovery_reason = NavHoldReason::LocalizationFailed;
             }
 
             if (recovery_phase != NavigationRecoveryPhase::None) {
@@ -428,7 +465,7 @@ void taskNav(void *pvParameters)
                         recovery_phase = NavigationRecoveryPhase::None;
                         recovery_reason = NavHoldReason::None;
                         recovery_phase_started_ms = 0U;
-                        zero_jog_started_ms = 0U;
+                        yaw_acquire_attempts = 0U;
                         path_valid = false;
                     }
                 }
@@ -438,22 +475,33 @@ void taskNav(void *pvParameters)
                             NavigationRecoveryPhase::YawCourseAcquire &&
                         static_cast<uint32_t>(
                             now_ms - recovery_phase_started_ms) >=
-                            YAW_ACQUIRE_BEFORE_RESET_MS) {
-                        requestState(
-                            SystemCmdType::NavigationRecoveryReset);
+                            YAW_ACQUIRE_DRIVE_MS) {
+                        ++yaw_acquire_attempts;
                         recovery_phase =
                             NavigationRecoveryPhase::AwaitFreshGps;
                         recovery_phase_started_ms = now_ms;
-                        last_navigation_reset_request_ms = now_ms;
-                        recovery_reason = NavHoldReason::RecoveryReset;
+                        recovery_reason = NavHoldReason::YawUnusable;
                     } else if (recovery_phase ==
                                    NavigationRecoveryPhase::AwaitFreshGps &&
+                               yaw_course_acquire_allowed &&
+                               yaw_acquire_attempts <
+                                   YAW_ACQUIRE_MAX_ATTEMPTS &&
+                               static_cast<uint32_t>(
+                                   now_ms - recovery_phase_started_ms) >=
+                                   YAW_ACQUIRE_RETRY_WAIT_MS) {
+                        recovery_phase =
+                            NavigationRecoveryPhase::YawCourseAcquire;
+                        recovery_phase_started_ms = now_ms;
+                    } else if (recovery_phase ==
+                                   NavigationRecoveryPhase::AwaitFreshGps &&
+                               has_coordinate &&
+                               coordinate.localization_quality ==
+                                   Domain::Localization::Quality::Failed &&
                                static_cast<uint32_t>(
                                    now_ms -
                                    last_navigation_reset_request_ms) >=
                                    YAW_RESET_RETRY_MS) {
-                        requestState(
-                            SystemCmdType::NavigationRecoveryReset);
+                        requestState(SystemCmdType::NavigationRecoveryReset);
                         last_navigation_reset_request_ms = now_ms;
                         recovery_reason = NavHoldReason::RecoveryReset;
                     }
@@ -463,11 +511,16 @@ void taskNav(void *pvParameters)
                     active_recovery_phase = recovery_phase;
                     active_navigation_reset_count =
                         status.navigation_reset_count;
-                    publishJog(
-                        YAW_RECOVERY_SPEED_MM_S,
-                        0.0f,
-                        JOG_DURATION_MS,
-                        recovery_reason);
+                    if (recovery_phase ==
+                        NavigationRecoveryPhase::YawCourseAcquire) {
+                        publishJog(
+                            YAW_RECOVERY_SPEED_MM_S,
+                            0.0f,
+                            JOG_DURATION_MS,
+                            recovery_reason);
+                    } else {
+                        publishStop(recovery_reason);
+                    }
                     publishNavigationProgress(
                         now_ms, planned_map_update_count, nullptr);
                     continue;
@@ -491,6 +544,7 @@ void taskNav(void *pvParameters)
             // GPS誤差で境界を往復しないよう、1 m内側まで復帰制御を維持する。
             if (field_recovery_active &&
                 !isInsideFieldInset(coordinate)) {
+                active_path_mode = PathMode::FieldRecovery;
                 path_valid = false;
                 have_last_traversed_cell = false;
                 publishNavigationProgress(
@@ -556,6 +610,7 @@ void taskNav(void *pvParameters)
 
             if (should_replan && retry_due) {
                 last_replan_ms = now_ms;
+                active_path_mode = PathMode::AStarNormal;
                 AStar::Result result = AStar::findPathFromWorldForPurePursuit(
                     grid_map,
                     static_cast<float>(coordinate.x_mm),
@@ -565,15 +620,16 @@ void taskNav(void *pvParameters)
                     pp_path,
                     128,
                     grid_path,
-                    128,
+                    AStar::CELL_COUNT,
                     astar_work,
                     astar_config
                 );
 
                 // 通常経路が無い場合だけ、値15を値14相当の高コストとして再探索する。
                 // 地図の証拠値自体は変更せず、次回もまず通常の安全な探索を行う。
-                if (!result.found || result.path_overflow ||
+                if (!result.found ||
                     result.path_count == 0) {
+                    active_path_mode = PathMode::AStarRelaxed;
                     AStar::Config relaxed_config = astar_config;
                     relaxed_config.allow_blocked_as_high_cost = true;
                     // GPS誤差で地図余白を一時的に外れた場合も、最寄りの
@@ -595,16 +651,53 @@ void taskNav(void *pvParameters)
                         pp_path,
                         128,
                         grid_path,
-                        128,
+                        AStar::CELL_COUNT,
                         astar_work,
                         relaxed_config
                     );
                 }
 
-                path_valid = result.found && !result.path_overflow && result.path_count > 0;
+                if (!result.found || result.path_count == 0U) {
+                    active_path_mode = PathMode::AStarEmergency;
+                    AStar::Config emergency_config = astar_config;
+                    emergency_config.allow_blocked_as_high_cost = true;
+                    emergency_config.unknown_extra_cost = 0U;
+                    result = AStar::findPathFromWorldForPurePursuit(
+                        grid_map,
+                        static_cast<float>(coordinate.x_mm),
+                        static_cast<float>(coordinate.y_mm),
+                        static_cast<float>(FieldConfig::GOAL_X_MM),
+                        static_cast<float>(FieldConfig::GOAL_Y_MM),
+                        pp_path,
+                        128,
+                        grid_path,
+                        AStar::CELL_COUNT,
+                        astar_work,
+                        emergency_config);
+                }
+
+                path_valid = result.found && result.path_count > 0;
                 pp_path_count = path_valid ? result.path_count : 0;
+                path_chunked = path_valid && result.path_overflow;
+                if (path_chunked) {
+                    active_path_mode = PathMode::AStarChunked;
+                }
+                direct_path_fallback = !path_valid;
+                if (direct_path_fallback) {
+                    active_path_mode = PathMode::DirectFallback;
+                    pp_path[0] = {
+                        static_cast<float>(coordinate.x_mm),
+                        static_cast<float>(coordinate.y_mm)};
+                    pp_path[1] = {
+                        static_cast<float>(FieldConfig::GOAL_X_MM),
+                        static_cast<float>(FieldConfig::GOAL_Y_MM)};
+                    pp_path_count = 2U;
+                    path_valid = true;
+                    path_chunked = false;
+                }
                 planned_map_update_count = current_map_update_count;
                 pp_state = PurePursuit::PathState{};
+                pure_pursuit_invalid_count = 0U;
             }
 
             if (!path_valid) {
@@ -629,17 +722,46 @@ void taskNav(void *pvParameters)
             publishNavigationProgress(
                 now_ms, planned_map_update_count, &output);
 
-            if (!output.valid || output.reached_goal) {
-                publishStop(output.reached_goal
-                    ? NavHoldReason::GoalTransition
-                    : NavHoldReason::PathUnavailable);
+            if (!output.valid) {
+                path_valid = false;
+                last_replan_ms = now_ms - REPLAN_RETRY_MS;
+                if (pure_pursuit_invalid_count < UINT8_MAX) {
+                    ++pure_pursuit_invalid_count;
+                }
+                if (pure_pursuit_invalid_count >= 3U ||
+                    direct_path_fallback) {
+                    active_path_mode = PathMode::DirectFallback;
+                    driveDirectlyToward(
+                        coordinate,
+                        static_cast<float>(FieldConfig::GOAL_X_MM),
+                        static_cast<float>(FieldConfig::GOAL_Y_MM),
+                        gps_warp_stabilizing
+                            ? GPS_WARP_STABILIZE_SPEED_MM_S
+                            : GPS_BASE_SPEED_MM_S);
+                } else {
+                    publishStop(NavHoldReason::PathUnavailable);
+                }
+            } else if (output.reached_goal) {
+                path_valid = false;
+                last_replan_ms = now_ms - REPLAN_RETRY_MS;
+                publishStop(path_chunked
+                    ? NavHoldReason::PathUnavailable
+                    : NavHoldReason::GoalTransition);
             } else {
-                publishJog(output.linear_velocity_mm_s, output.angular_velocity_rad_s);
+                pure_pursuit_invalid_count = 0U;
+                const float velocity_mm_s = gps_warp_stabilizing
+                    ? clampFloat(
+                        output.linear_velocity_mm_s,
+                        -GPS_WARP_STABILIZE_SPEED_MM_S,
+                        GPS_WARP_STABILIZE_SPEED_MM_S)
+                    : output.linear_velocity_mm_s;
+                publishJog(velocity_mm_s, output.angular_velocity_rad_s);
             }
             continue;
         }
 
         if (status.state == SystemState::STATE_CAMERA_NAV) {
+            active_path_mode = PathMode::None;
             publishNavigationProgress(
                 now_ms, planned_map_update_count, nullptr);
 
@@ -659,6 +781,16 @@ void taskNav(void *pvParameters)
                 output.velocity_mm_s,
                 output.omega_rad_s,
                 output.duration_ms);
+            if (output.link_lost) {
+                Coordinate fallback_coordinate{};
+                if (xQueuePeek(
+                        mbx_coordinate,
+                        &fallback_coordinate,
+                        0) == pdTRUE &&
+                    coordinateIsUsable(fallback_coordinate, now_ms)) {
+                    requestState(SystemCmdType::StartGpsNav);
+                }
+            }
             if (output.goal_reached) {
                 requestState(SystemCmdType::NotifyGoal);
             }

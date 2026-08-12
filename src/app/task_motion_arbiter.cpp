@@ -88,19 +88,6 @@ void taskMotionArbiter(void* pvParameters)
                 const bool yaw_usable = has_coordinate &&
                     (coordinate.localization_status_flags &
                      Domain::Localization::STATUS_YAW_USABLE) != 0U;
-                const bool only_magnetic_unhealthy =
-                    position_usable && yaw_usable &&
-                    coordinate.localization_quality ==
-                        Domain::Localization::Quality::Degraded &&
-                    coordinate.magnetic_health ==
-                        Domain::Localization::SensorHealth::Failed &&
-                    coordinate.gps_health !=
-                        Domain::Localization::SensorHealth::Failed &&
-                    coordinate.encoder_health !=
-                        Domain::Localization::SensorHealth::Failed &&
-                    coordinate.imu_health !=
-                        Domain::Localization::SensorHealth::Failed;
-
                 if (!has_coordinate) {
                     scale = 0.0f;
                     hold_reason = NavHoldReason::CoordinateUnavailable;
@@ -114,16 +101,6 @@ void taskMotionArbiter(void* pvParameters)
                     hold_reason = !yaw_usable
                         ? NavHoldReason::YawUnusable
                         : NavHoldReason::LocalizationFailed;
-                } else if (only_magnetic_unhealthy) {
-                    // Magnetic-only degradation must not create the low-speed
-                    // loop that prevents a fresh GPS course measurement.
-                    scale = 1.0f;
-                } else if (coordinate.localization_quality ==
-                           Domain::Localization::Quality::Degraded) {
-                    scale = 0.75f;
-                } else if (coordinate.localization_quality ==
-                           Domain::Localization::Quality::Unreliable) {
-                    scale = 0.60f;
                 }
             } else if (
                 request.source ==

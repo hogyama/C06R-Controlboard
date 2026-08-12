@@ -8,10 +8,10 @@
 
 // 1回のMAPは2048B = 2KB(64x64マップ、1セル4bit)
 // MAP保存領域のセクタは header 256B x3 + MAP 1024B x3 + padding 256B = 4096B = 4KBとする
-// 1回のログは128B
+// 1回のログは256B
 
 // MAP保存領域は128KB = 4KB * 32セクタより、96回のMAPを保存可能
-// FILEは5120KB = 1280 * 4KB = 5MBより、40960個のログを保存可能
+// FILEは5120KB = 1280 * 4KB = 5MBより、20480個のログを保存可能
 
 // MAP保存領域 x 2 + FILE保存領域 x 3として運用する
 
@@ -60,8 +60,8 @@
 #define FILES_END_ADDRESS 0xF3FFFF
 
 #define FILE_SIZE 0x500000      // FILEのサイズ（5MB）
-#define LOG_RECORD_SIZE 128     // header 16 byte + log 112 byte
-#define MAX_LOGS_PER_FILE (FILE_SIZE / LOG_RECORD_SIZE) // 1FILEあたり40960ログ
+#define LOG_RECORD_SIZE 256     // header 16 byte + log 240 byte
+#define MAX_LOGS_PER_FILE (FILE_SIZE / LOG_RECORD_SIZE) // 1FILEあたり20480ログ
 #define MAX_FILES 3             // FLASHに保存可能なFILEの最大数
 
 static_assert(
@@ -93,38 +93,55 @@ static_assert(MAX_MAPS * SECTOR_SIZE == MAP_REGION_SIZE,
 namespace Flash {
     constexpr uint8_t MAP_FORMAT_VERSION = 2;
     constexpr uint8_t MAP_BITS_PER_CELL = 4;
-    constexpr uint8_t LOG_FORMAT_VERSION = 12;
+    constexpr uint8_t LOG_FORMAT_VERSION = 15;
 
-    // Compact 100 ms snapshot. Header + frame fits one 128-byte record.
+    // Complete 100 ms snapshot. Header + frame fits one 256-byte record.
     struct LogFrame {
         uint8_t format_version;
-        int8_t flash_file_index;
         uint8_t mission_state;
         uint8_t boot_mode;
+        uint8_t localization_quality;
         uint32_t message_number;
         uint32_t timestamp_ms;
-        uint16_t valid_flags;
+        uint32_t valid_flags;
         uint16_t localization_status_flags;
-
+        uint8_t health_states;
+        uint8_t sensor_sources;
+        uint8_t nav_hold_reason;
+        uint8_t recovery_phase;
+        uint8_t path_mode;
+        uint8_t rasp_state;
+        uint8_t gps_state;
+        uint8_t stuck_reason;
+        uint8_t stuck_verification_result;
+        uint8_t stuck_verification_phase;
+        uint8_t camera_flags;
+        uint8_t camera_confidence;
+        uint16_t target_path_index;
+        uint32_t gps_warp_count;
         int32_t x_mm;
         int32_t y_mm;
         uint16_t yaw_deg_1e2;
         int16_t forward_velocity_mm_s;
+        int16_t yaw_rate_rad_s_x1000;
+        uint16_t position_std_mm;
+        uint16_t yaw_std_mrad;
         int32_t lat_1e7;
         int32_t lng_1e7;
         uint8_t gps_fix_type;
         uint8_t gps_satellites;
         uint16_t gps_horizontal_accuracy_mm;
-        uint8_t sensor_sources;
-        uint8_t camera_flags;
         int16_t camera_angle_error_deg10;
         uint16_t camera_occupancy_permille;
-        uint8_t camera_confidence;
-        uint8_t stuck_reason;
-        uint8_t stuck_verification_result;
-        uint8_t rasp_state;
-        uint8_t gps_state;
-        uint8_t flash_state;
+        uint32_t camera_message_number;
+        uint16_t camera_age_ms;
+        uint64_t camera_scene_hash;
+        int16_t jog_velocity_mm_s;
+        int16_t jog_omega_rad_s_x100;
+        uint16_t jog_remaining_ms;
+        uint8_t jog_source;
+        int16_t jog_before_scale_mm_s;
+        int16_t jog_after_scale_mm_s;
         int16_t board_acc_x_mg;
         int16_t board_acc_y_mg;
         int16_t board_acc_z_mg;
@@ -146,14 +163,48 @@ namespace Flash {
         uint16_t pressure_pa_div10;
         int32_t encoder_left_mm;
         int32_t encoder_right_mm;
-        uint64_t camera_scene_hash;
+        uint16_t board_accel_age_ms;
+        uint16_t board_gyro_age_ms;
+        uint16_t board_magnetic_age_ms;
+        uint16_t can_accel_age_ms;
+        uint16_t can_gyro_age_ms;
+        uint16_t can_magnetic_age_ms;
+        uint16_t pressure_age_ms;
+        uint16_t encoder_age_ms;
+        uint16_t gps_age_ms;
+        uint16_t coordinate_age_ms;
+        int16_t latest_gyro_x_rad_s_x1000;
+        int16_t latest_gyro_y_rad_s_x1000;
+        int16_t latest_gyro_z_rad_s_x1000;
+        int32_t gyro_integrated_z_urad_100ms;
+        int16_t gyro_min_z_rad_s_x1000;
+        int16_t gyro_max_z_rad_s_x1000;
         uint16_t gyro_samples_100ms;
         uint8_t accel_samples_100ms;
         uint8_t magnetic_samples_100ms;
         uint16_t imu_fifo_overflow_count;
+        uint16_t gps_power_cycle_count;
+        uint16_t gps_configuration_retry_count;
+        uint16_t gps_checksum_failure_count;
+        uint64_t stuck_hash_before;
+        uint64_t stuck_hash_after;
+        uint8_t stuck_hash_distance_bits;
+        int16_t gps_warp_east_mm;
+        int16_t gps_warp_north_mm;
+        // The field definition used by this run. Keeping it in every record
+        // makes a partial log independently convertible on the PC.
+        int32_t goal_latitude_e7;
+        int32_t goal_longitude_e7;
+        int32_t goal_x_mm;
+        int32_t goal_y_mm;
+        int32_t field_size_x_mm;
+        int32_t field_size_y_mm;
+        uint8_t reserved[8];
     } __attribute__((packed));
 
-    static_assert(sizeof(LogFrame) == 112, "Flash LogFrame v12 size mismatch");
+    static_assert(offsetof(LogFrame, goal_latitude_e7) == 208,
+                  "Flash LogFrame v15 field config offset mismatch");
+    static_assert(sizeof(LogFrame) == 240, "Flash LogFrame v15 size mismatch");
 }
 
 class SrvFlash

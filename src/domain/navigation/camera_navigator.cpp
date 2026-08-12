@@ -63,7 +63,9 @@ constexpr float CAMERA_STILL_GYRO_RAD_S = 0.30f;
 constexpr float CAMERA_DELAY_GYRO_DEADBAND_RAD_S = 0.05f;
 constexpr float CAMERA_STILL_ENCODER_MM_S = 100.0f;
 constexpr uint32_t CAMERA_STILL_CONFIRM_MS = 200;
+constexpr uint32_t CAMERA_STILL_NO_SENSOR_MS = 400;
 constexpr uint32_t CAMERA_ENCODER_TIMEOUT_MS = 100;
+constexpr float CAMERA_TRACK_WIDTH_MM = 180.0f;
 
 // 明示的な未検出ごとに45度旋回する
 // 探索では逆方向の補正旋回を行わない。
@@ -226,6 +228,7 @@ struct State {
     float camera_accumulated_turn_rad = 0.0f;
     float camera_previous_gyro_z_rad_s = 0.0f;
     uint32_t camera_previous_gyro_timestamp_ms = 0;
+    uint32_t camera_turn_started_ms = 0;
     uint32_t camera_still_started_ms = 0;
     // 正面へ収まるまで、停止後画像による逆方向補正は1回だけ許可する。
     int8_t camera_last_target_turn_direction = 0;
@@ -261,6 +264,8 @@ struct State {
     int32_t camera_search_start_left_mm = 0;
     int32_t camera_search_start_right_mm = 0;
     float camera_search_target_distance_mm = 0.0f;
+    uint32_t camera_search_translate_started_ms = 0;
+    uint32_t camera_search_translate_duration_ms = 0;
 };
 
 State state{};
@@ -380,14 +385,23 @@ Output update(const Input& input)
                         (camera_encoder.metadata.timestamp_us -
                          state.camera_previous_encoder.metadata.timestamp_us) / 1000ULL);
                     if (encoder_dt_ms <= CAMERA_ENCODER_TIMEOUT_MS) {
+                        const float delta_left_mm = static_cast<float>(
+                            camera_encoder.left_mm -
+                            state.camera_previous_encoder.left_mm);
+                        const float delta_right_mm = static_cast<float>(
+                            camera_encoder.right_mm -
+                            state.camera_previous_encoder.right_mm);
                         state.camera_left_velocity_mm_s =
-                            (camera_encoder.left_mm -
-                             state.camera_previous_encoder.left_mm) *
-                            (1000.0f / encoder_dt_ms);
+                            delta_left_mm * (1000.0f / encoder_dt_ms);
                         state.camera_right_velocity_mm_s =
-                            (camera_encoder.right_mm -
-                             state.camera_previous_encoder.right_mm) *
-                            (1000.0f / encoder_dt_ms);
+                            delta_right_mm * (1000.0f / encoder_dt_ms);
+                        if (!camera_gyro_usable &&
+                            (state.camera_phase == CameraPhase::TurnDriving ||
+                             state.camera_phase == CameraPhase::TurnCoasting)) {
+                            state.camera_accumulated_turn_rad +=
+                                (delta_right_mm - delta_left_mm) /
+                                CAMERA_TRACK_WIDTH_MM;
+                        }
                         state.camera_encoder_velocity_ms = static_cast<uint32_t>(
                             camera_encoder.metadata.received_us / 1000ULL);
                     } else {
@@ -414,8 +428,8 @@ Output update(const Input& input)
                      CAMERA_STILL_ENCODER_MM_S &&
                  fabsf(state.camera_right_velocity_mm_s) <
                      CAMERA_STILL_ENCODER_MM_S);
-            const bool camera_is_still_now = camera_has_still_reference &&
-                camera_gyro_still && camera_encoder_still;
+            const bool camera_is_still_now = !camera_has_still_reference ||
+                (camera_gyro_still && camera_encoder_still);
             if (camera_is_still_now) {
                 if (state.camera_still_started_ms == 0) {
                     state.camera_still_started_ms = now_ms;
@@ -423,10 +437,12 @@ Output update(const Input& input)
             } else {
                 state.camera_still_started_ms = 0;
             }
+            const uint32_t still_confirm_ms = camera_has_still_reference
+                ? CAMERA_STILL_CONFIRM_MS : CAMERA_STILL_NO_SENSOR_MS;
             const bool camera_still_confirmed =
                 state.camera_still_started_ms != 0 &&
                 static_cast<uint32_t>(now_ms - state.camera_still_started_ms) >=
-                    CAMERA_STILL_CONFIRM_MS;
+                    still_confirm_ms;
 
             auto startCameraTurn = [&](
                 CameraTurnPurpose purpose,
@@ -435,6 +451,7 @@ Output update(const Input& input)
                 state.camera_turn_purpose = purpose;
                 state.camera_turn_target_rad = target_rad;
                 state.camera_accumulated_turn_rad = 0.0f;
+                state.camera_turn_started_ms = now_ms;
                 state.camera_still_started_ms = 0;
                 state.camera_previous_gyro_z_rad_s =
                     camera_gyro_usable ? camera_gyro.z_rad_s : 0.0f;
@@ -443,18 +460,20 @@ Output update(const Input& input)
             };
 
             auto startSearchTranslation = [&]() {
-                if (!camera_has_encoder) {
-                    state.camera_phase = CameraPhase::StopSettling;
-                    state.camera_after_stop = CameraAfterStop::WaitFrame;
-                    return;
-                }
                 const uint8_t expansion =
                     static_cast<uint8_t>(state.camera_search_leg_index / 2U + 1U);
                 state.camera_search_target_distance_mm = fminf(
                     CAMERA_SEARCH_LEG_BASE_MM * expansion,
                     CAMERA_SEARCH_LEG_MAX_MM);
-                state.camera_search_start_left_mm = camera_encoder.left_mm;
-                state.camera_search_start_right_mm = camera_encoder.right_mm;
+                if (camera_has_encoder) {
+                    state.camera_search_start_left_mm = camera_encoder.left_mm;
+                    state.camera_search_start_right_mm = camera_encoder.right_mm;
+                }
+                state.camera_search_translate_started_ms = now_ms;
+                state.camera_search_translate_duration_ms =
+                    static_cast<uint32_t>(lroundf(
+                        state.camera_search_target_distance_mm * 1000.0f /
+                        CAMERA_SEARCH_MOVE_SPEED_MM_S));
                 state.camera_phase = CameraPhase::SearchTranslate;
                 state.camera_still_started_ms = 0;
             };
@@ -1031,6 +1050,7 @@ Output update(const Input& input)
             // 500ms通信断では途中の制御判断を破棄し、復帰後の新規フレームを待つ。
             if (camera_frame_age_ms > CAMERA_COMM_TIMEOUT_MS) {
                 publishStop();
+                current_output.link_lost = true;
                 state.camera_forward_command_mm_s = 0.0f;
                 state.camera_forward_acceleration_mm_s2 = 0.0f;
                 state.camera_forward_command_ms = now_ms;
@@ -1087,26 +1107,35 @@ Output update(const Input& input)
             }
 
             if (state.camera_phase == CameraPhase::TurnDriving) {
-                if (!camera_gyro_usable) {
-                    publishStop();
-                    state.camera_phase = CameraPhase::StopSettling;
-                    state.camera_after_stop = CameraAfterStop::WaitFrame;
-                    state.camera_turn_purpose = CameraTurnPurpose::None;
-                    state.camera_previous_gyro_timestamp_ms = 0;
-                    state.camera_still_started_ms = 0;
+                const float reached_rad =
+                    state.camera_turn_purpose == CameraTurnPurpose::SearchStep
+                        ? CAMERA_SEARCH_REACHED_RAD
+                        : CAMERA_TURN_REACHED_RAD;
+                const bool encoder_turn_usable =
+                    camera_encoder_velocity_usable;
+                float yaw_rate_rad_s = 0.0f;
+                if (camera_gyro_usable) {
+                    yaw_rate_rad_s = camera_gyro.z_rad_s;
+                } else if (encoder_turn_usable) {
+                    yaw_rate_rad_s =
+                        (state.camera_right_velocity_mm_s -
+                         state.camera_left_velocity_mm_s) /
+                        CAMERA_TRACK_WIDTH_MM;
                 } else {
-                    const float reached_rad =
-                        state.camera_turn_purpose == CameraTurnPurpose::SearchStep
-                            ? CAMERA_SEARCH_REACHED_RAD
-                            : CAMERA_TURN_REACHED_RAD;
-                    if (driveCameraTurn(
-                            state.camera_turn_target_rad,
-                            state.camera_accumulated_turn_rad,
-                            camera_gyro.z_rad_s,
-                            reached_rad)) {
-                        state.camera_phase = CameraPhase::TurnCoasting;
-                        state.camera_still_started_ms = 0;
-                    }
+                    const float direction =
+                        state.camera_turn_target_rad >= 0.0f ? 1.0f : -1.0f;
+                    state.camera_accumulated_turn_rad = direction *
+                        CAMERA_TURN_OMEGA_RAD_S *
+                        static_cast<float>(now_ms - state.camera_turn_started_ms) *
+                        0.001f;
+                }
+                if (driveCameraTurn(
+                        state.camera_turn_target_rad,
+                        state.camera_accumulated_turn_rad,
+                        yaw_rate_rad_s,
+                        reached_rad)) {
+                    state.camera_phase = CameraPhase::TurnCoasting;
+                    state.camera_still_started_ms = 0;
                 }
                 return current_output;
             }
@@ -1222,21 +1251,24 @@ Output update(const Input& input)
             }
 
             if (state.camera_phase == CameraPhase::SearchTranslate) {
-                if (!camera_has_encoder ||
-                    !camera_encoder_velocity_usable) {
-                    publishStop();
-                    state.camera_forward_command_mm_s = 0.0f;
-                    state.camera_forward_command_ms = now_ms;
-                    return current_output;
+                float travelled_mm = 0.0f;
+                bool translation_complete = false;
+                if (camera_has_encoder && camera_encoder_velocity_usable) {
+                    const float left_distance_mm = static_cast<float>(
+                        camera_encoder.left_mm - state.camera_search_start_left_mm);
+                    const float right_distance_mm = static_cast<float>(
+                        camera_encoder.right_mm - state.camera_search_start_right_mm);
+                    travelled_mm = fabsf(
+                        0.5f * (left_distance_mm + right_distance_mm));
+                    translation_complete =
+                        travelled_mm >= state.camera_search_target_distance_mm;
+                } else {
+                    translation_complete = static_cast<uint32_t>(
+                        now_ms - state.camera_search_translate_started_ms) >=
+                        state.camera_search_translate_duration_ms;
                 }
-                const float left_distance_mm = static_cast<float>(
-                    camera_encoder.left_mm - state.camera_search_start_left_mm);
-                const float right_distance_mm = static_cast<float>(
-                    camera_encoder.right_mm - state.camera_search_start_right_mm);
-                const float travelled_mm = fabsf(
-                    0.5f * (left_distance_mm + right_distance_mm));
 
-                if (travelled_mm >= state.camera_search_target_distance_mm) {
+                if (translation_complete) {
                     if (state.camera_search_leg_index < UINT8_MAX) {
                         ++state.camera_search_leg_index;
                     }

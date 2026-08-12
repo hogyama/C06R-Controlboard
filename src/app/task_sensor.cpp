@@ -165,6 +165,9 @@ void taskSensor(void* pvParameters)
         bus_ready && magnetic_sensor.begin(sensor_bus, BMM350_I2C_ADDRESS);
 
     Sensor::AcquisitionStats stats{};
+    Sensor::GyroscopeData previous_stats_gyro{};
+    bool have_previous_stats_gyro = false;
+    bool have_stats_gyro = false;
     uint32_t last_imu_retry_ms = millis();
     uint32_t last_magnetic_retry_ms = millis();
     uint32_t last_magnetic_poll_ms = millis();
@@ -198,6 +201,30 @@ void taskSensor(void* pvParameters)
                     const Sensor::GyroscopeData& sample =
                         result.gyroscope[index];
                     if (!finiteGyroscope(sample)) continue;
+                    stats.latest_gyro_x_rad_s = sample.x_rad_s;
+                    stats.latest_gyro_y_rad_s = sample.y_rad_s;
+                    stats.latest_gyro_z_rad_s = sample.z_rad_s;
+                    if (!have_stats_gyro) {
+                        stats.minimum_gyro_z_rad_s = sample.z_rad_s;
+                        stats.maximum_gyro_z_rad_s = sample.z_rad_s;
+                        have_stats_gyro = true;
+                    } else {
+                        stats.minimum_gyro_z_rad_s = fminf(
+                            stats.minimum_gyro_z_rad_s, sample.z_rad_s);
+                        stats.maximum_gyro_z_rad_s = fmaxf(
+                            stats.maximum_gyro_z_rad_s, sample.z_rad_s);
+                    }
+                    if (have_previous_stats_gyro &&
+                        sample.metadata.timestamp_us >
+                            previous_stats_gyro.metadata.timestamp_us) {
+                        const float dt_s = static_cast<float>(
+                            sample.metadata.timestamp_us -
+                            previous_stats_gyro.metadata.timestamp_us) * 1.0e-6f;
+                        stats.integrated_gyro_z_rad += 0.5f *
+                            (previous_stats_gyro.z_rad_s + sample.z_rad_s) * dt_s;
+                    }
+                    previous_stats_gyro = sample;
+                    have_previous_stats_gyro = true;
                     pushGyroscopeRing(fifo_board_gyroscope, sample);
                     pushGyroscopeRing(fifo_stuck_board_gyroscope, sample);
                     xQueueOverwrite(mbx_board_gyroscope, &sample);
@@ -246,6 +273,11 @@ void taskSensor(void* pvParameters)
             stats.gyro_samples = 0;
             stats.accel_samples = 0;
             stats.magnetic_samples = 0;
+            stats.integrated_gyro_z_rad = 0.0f;
+            stats.minimum_gyro_z_rad_s = 0.0f;
+            stats.maximum_gyro_z_rad_s = 0.0f;
+            have_previous_stats_gyro = false;
+            have_stats_gyro = false;
         }
 
         publishSelectedSensors(static_cast<uint64_t>(esp_timer_get_time()));

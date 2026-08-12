@@ -13,6 +13,7 @@ public:
     {
         report_ = {};
         report_.state = SensorHealth::Failed;
+        bad_since_received_us_ = 0;
     }
 
     void noteSample(const Sensor::SampleMetadata& metadata)
@@ -26,6 +27,7 @@ public:
         report_.last_innovation = innovation;
         report_.last_mahalanobis = mahalanobis;
         report_.consecutive_bad = 0;
+        bad_since_received_us_ = 0;
         if (report_.consecutive_good != UINT16_MAX) {
             ++report_.consecutive_good;
         }
@@ -36,6 +38,9 @@ public:
         report_.last_innovation = innovation;
         report_.last_mahalanobis = mahalanobis;
         report_.consecutive_good = 0;
+        if (report_.consecutive_bad == 0U) {
+            bad_since_received_us_ = report_.last_received_us;
+        }
         if (report_.consecutive_bad != UINT16_MAX) {
             ++report_.consecutive_bad;
         }
@@ -51,7 +56,12 @@ public:
             report_.state = SensorHealth::Failed;
         } else {
             const uint64_t age_us = now_us - report_.last_received_us;
-            if (age_us > failed_us ||
+            const bool rejected_too_long =
+                bad_since_received_us_ != 0U &&
+                report_.last_received_us >= bad_since_received_us_ &&
+                report_.last_received_us - bad_since_received_us_ >=
+                    config.health_rejection_failure_us;
+            if (age_us > failed_us || rejected_too_long ||
                 report_.consecutive_bad >= config.health_failure_rejections) {
                 report_.state = SensorHealth::Failed;
             } else if (age_us > stale_us) {
@@ -72,6 +82,7 @@ public:
 
 private:
     SensorHealthReport report_{};
+    uint64_t bad_since_received_us_ = 0;
 };
 
 } // namespace Domain::Localization

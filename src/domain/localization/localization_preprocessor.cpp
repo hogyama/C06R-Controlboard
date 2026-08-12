@@ -171,6 +171,18 @@ EncoderVelocityObservation Preprocessor::processEncoder(
     result.right_velocity_m_s = delta_right_mm * inverse_dt;
     result.velocity_m_s =
         0.5f * (result.left_velocity_m_s + result.right_velocity_m_s);
+    result.interval_us = dt_us;
+    result.delta_distance_m =
+        0.5f * static_cast<float>(delta_left_mm + delta_right_mm) * 0.001f;
+    result.delta_yaw_rad = config_.encoder_track_width_m > 0.0f
+        ? static_cast<float>(delta_right_mm - delta_left_mm) * 0.001f /
+            config_.encoder_track_width_m
+        : 0.0f;
+    result.yaw_rate_rad_s =
+        result.delta_yaw_rad * 1000000.0f / static_cast<float>(dt_us);
+    result.yaw_variance_rad2 =
+        fmaxf(config_.encoder_yaw_noise_rad2_s, 0.0f) *
+        static_cast<float>(dt_us) * 1.0e-6f;
     result.variance_m2_s2 = square(config_.encoder_velocity_std_m_s);
     if (!isfinite(result.velocity_m_s) ||
         fabsf(result.left_velocity_m_s) > config_.encoder_maximum_speed_m_s ||
@@ -217,11 +229,11 @@ void Preprocessor::updateAcceleration(
     acceleration_variance_ /= acceleration_window_count_;
 }
 
-MagneticHeadingObservation Preprocessor::processMagnetic(
+MagneticDiagnostic Preprocessor::magneticDiagnostic(
     const Sensor::MagneticData& magnetic_body)
+    const
 {
-    MagneticHeadingObservation result{};
-    result.metadata = magnetic_body.metadata;
+    MagneticDiagnostic result{};
     if (!magnetic_body.metadata.valid || !isfinite(magnetic_body.x_uT) ||
         !isfinite(magnetic_body.y_uT) || !isfinite(magnetic_body.z_uT)) {
         return result;
@@ -230,6 +242,7 @@ MagneticHeadingObservation Preprocessor::processMagnetic(
     const bool apply_board_calibration =
         magnetic_body.metadata.source == Sensor::Source::BoardI2c &&
         magnetic_calibration_.valid;
+    result.calibration_applied = apply_board_calibration;
     const float raw[3] = {
         magnetic_body.x_uT - (apply_board_calibration
             ? magnetic_calibration_.hard_iron_uT[0] : 0.0f),
@@ -237,17 +250,19 @@ MagneticHeadingObservation Preprocessor::processMagnetic(
             ? magnetic_calibration_.hard_iron_uT[1] : 0.0f),
         magnetic_body.z_uT - (apply_board_calibration
             ? magnetic_calibration_.hard_iron_uT[2] : 0.0f)};
-    float magnetic[3]{};
     for (uint8_t row = 0; row < 3; ++row) {
         for (uint8_t column = 0; column < 3; ++column) {
             const float coefficient = apply_board_calibration
                 ? magnetic_calibration_.soft_iron[row][column]
                 : (row == column ? 1.0f : 0.0f);
-            magnetic[row] += coefficient * raw[column];
+            result.corrected_uT[row] += coefficient * raw[column];
         }
+        if (!isfinite(result.corrected_uT[row])) return MagneticDiagnostic{};
     }
+    result.vector_valid = true;
     result.field_strength_uT =
-        hypotf(hypotf(magnetic[0], magnetic[1]), magnetic[2]);
+        hypotf(hypotf(result.corrected_uT[0], result.corrected_uT[1]),
+            result.corrected_uT[2]);
     if (result.field_strength_uT < config_.magnetic_minimum_total_uT ||
         result.field_strength_uT > config_.magnetic_maximum_total_uT ||
         acceleration_norm_m_s2_ < 1.0f) return result;
@@ -257,11 +272,13 @@ MagneticHeadingObservation Preprocessor::processMagnetic(
         acceleration_body_m_s2_[1] / acceleration_norm_m_s2_,
         acceleration_body_m_s2_[2] / acceleration_norm_m_s2_};
     const float vertical =
-        magnetic[0] * up[0] + magnetic[1] * up[1] + magnetic[2] * up[2];
+        result.corrected_uT[0] * up[0] +
+        result.corrected_uT[1] * up[1] +
+        result.corrected_uT[2] * up[2];
     const float horizontal[3] = {
-        magnetic[0] - vertical * up[0],
-        magnetic[1] - vertical * up[1],
-        magnetic[2] - vertical * up[2]};
+        result.corrected_uT[0] - vertical * up[0],
+        result.corrected_uT[1] - vertical * up[1],
+        result.corrected_uT[2] - vertical * up[2]};
     const float horizontal_strength =
         hypotf(horizontal[0], horizontal[1]);
     if (horizontal_strength < config_.magnetic_minimum_horizontal_uT) {
@@ -271,6 +288,19 @@ MagneticHeadingObservation Preprocessor::processMagnetic(
     result.heading_rad = Ekf5::wrapPi(
         atan2f(horizontal[0], horizontal[1]) -
         config_.magnetic_declination_rad);
+    result.heading_valid = isfinite(result.heading_rad);
+    return result;
+}
+
+MagneticHeadingObservation Preprocessor::processMagnetic(
+    const Sensor::MagneticData& magnetic_body)
+{
+    MagneticHeadingObservation result{};
+    result.metadata = magnetic_body.metadata;
+    const MagneticDiagnostic diagnostic = magneticDiagnostic(magnetic_body);
+    result.field_strength_uT = diagnostic.field_strength_uT;
+    result.heading_rad = diagnostic.heading_rad;
+    if (!diagnostic.heading_valid) return result;
     if (have_previous_magnetic_heading_ &&
         fabsf(Ekf5::wrapPi(
             result.heading_rad - previous_magnetic_heading_rad_)) >

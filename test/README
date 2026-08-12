@@ -38,3 +38,14 @@ Stack and flip detector host tests:
 
 These tests cover wheel blocking, reverse rotation, slip evidence from GNSS,
 gyro and fallback timing, and the 500 ms source-aware flip confirmation.
+
+Magnetic calibration host simulation:
+
+    g++ -std=c++17 -O2 -Isrc test/magnetic_calibrator_test.cpp \
+        src/domain/localization/magnetic_calibrator.cpp \
+        -o .pio/magnetic_calibrator_test.exe
+    .pio/magnetic_calibrator_test.exe
+
+The simulation rejects repeated poses, planar motion, tilted planar motion,
+an upper hemisphere, and CAN samples. It also verifies an ideal full sphere
+and a noisy full sphere after a long biased history, including fit accuracy.

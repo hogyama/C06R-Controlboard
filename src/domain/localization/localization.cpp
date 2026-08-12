@@ -16,6 +16,20 @@ Sensor::SampleMetadata metadataForGyro(
         gyroscope.valid};
 }
 
+float median(float* values, uint8_t count)
+{
+    for (uint8_t i = 1; i < count; ++i) {
+        const float value = values[i];
+        uint8_t position = i;
+        while (position > 0U && values[position - 1U] > value) {
+            values[position] = values[position - 1U];
+            --position;
+        }
+        values[position] = value;
+    }
+    return values[count / 2U];
+}
+
 } // namespace
 
 Localization::Localization(const Config& config)
@@ -42,6 +56,32 @@ void Localization::reset()
     magnetic_field_uT_ = 0.0f;
     magnetic_reject_reason_ = MagneticRejectReason::None;
     gps_course_reject_reason_ = GpsCourseRejectReason::None;
+    last_good_snapshot_ = {};
+    have_last_good_snapshot_ = false;
+    memset(gps_residuals_, 0, sizeof(gps_residuals_));
+    gps_residual_count_ = 0;
+    gps_residual_write_ = 0;
+    gps_warp_count_ = 0;
+    gps_warp_timestamp_us_ = 0;
+    gps_warp_east_m_ = 0.0f;
+    gps_warp_north_m_ = 0.0f;
+}
+
+bool Localization::recoverFromLastGood()
+{
+    if (!have_last_good_snapshot_) return false;
+    const Ekf5::Snapshot checkpoint = last_good_snapshot_;
+    memset(history_, 0, sizeof(history_));
+    history_oldest_ = 0;
+    history_count_ = 0;
+    gps_health_.reset();
+    encoder_health_.reset();
+    gyro_health_.reset();
+    accel_health_.reset();
+    magnetic_health_.reset();
+    cycle_status_flags_ = STATUS_NONE;
+    fault_flags_ = FAULT_NONE;
+    return ekf_.restore(checkpoint);
 }
 
 bool Localization::initializeFromGps(
@@ -126,10 +166,18 @@ void Localization::appendHistory(const HistoryEntry& entry)
 bool Localization::processCycle(const CycleInput& input)
 {
     if (!ekf_.initialized()) return false;
+    CycleInput normalized = input;
+    if (normalized.timestamp_us == 0U) {
+        normalized.timestamp_us = normalized.gyroscope.valid
+            ? normalized.gyroscope.end_timestamp_us
+            : (normalized.has_encoder
+                ? normalized.encoder.metadata.timestamp_us
+                : ekf_.timestampUs());
+    }
     HistoryEntry entry{};
     entry.before = ekf_.snapshot();
-    entry.input = input;
-    const bool result = applyCycle(input, true);
+    entry.input = normalized;
+    const bool result = applyCycle(normalized, true);
     appendHistory(entry);
     return result;
 }
@@ -138,6 +186,7 @@ bool Localization::applyCycle(const CycleInput& input, bool record_health)
 {
     cycle_status_flags_ = STATUS_NONE;
     bool changed = false;
+    bool motion_predicted = false;
     if (input.gyroscope.valid) {
         latest_gyro_z_rad_s_ = input.gyroscope.latest_z_rad_s;
         if (record_health) gyro_health_.noteSample(metadataForGyro(input.gyroscope));
@@ -147,6 +196,7 @@ bool Localization::applyCycle(const CycleInput& input, bool record_health)
             else gyro_health_.noteRejected();
         }
         if (accepted) {
+            motion_predicted = true;
             cycle_status_flags_ |= STATUS_IMU_USED;
             active_sensor_flags_ &= ~(ACTIVE_GYRO_BOARD | ACTIVE_GYRO_CAN);
             active_sensor_flags_ |=
@@ -162,8 +212,11 @@ bool Localization::applyCycle(const CycleInput& input, bool record_health)
 
     if (input.has_encoder) {
         if (record_health) encoder_health_.noteSample(input.encoder.metadata);
-        const bool accepted =
-            input.encoder.valid && ekf_.updateEncoderVelocity(input.encoder);
+        if (!motion_predicted && input.encoder.valid) {
+            motion_predicted = ekf_.predictEncoderMotion(input.encoder);
+        }
+        const bool accepted = input.encoder.valid &&
+            ekf_.updateEncoderVelocity(input.encoder);
         if (record_health) {
             if (accepted) encoder_health_.noteAccepted(
                 input.encoder.velocity_m_s -
@@ -181,6 +234,10 @@ bool Localization::applyCycle(const CycleInput& input, bool record_health)
             cycle_status_flags_ |= STATUS_ENCODER_REJECTED;
             fault_flags_ |= FAULT_ENCODER_RANGE;
         }
+    }
+
+    if (input.timestamp_us > ekf_.timestampUs()) {
+        changed = ekf_.predictCoast(input.timestamp_us) || changed;
     }
 
     if (input.has_magnetic) {
@@ -222,6 +279,7 @@ bool Localization::applyCycle(const CycleInput& input, bool record_health)
         changed = changed || velocity_updated || bias_updated;
     }
     if (!ekf_.covarianceValid()) fault_flags_ |= FAULT_COVARIANCE;
+    else fault_flags_ &= ~FAULT_COVARIANCE;
     return changed;
 }
 
@@ -229,14 +287,17 @@ bool Localization::processGps(const GpsObservation& observation)
 {
     if (!ekf_.initialized()) return false;
     gps_health_.noteSample(observation.metadata);
+    bool accepted = false;
     if (observation.metadata.timestamp_us < ekf_.timestampUs()) {
-        return replayDelayedGps(observation);
+        accepted = replayDelayedGps(observation);
+        return applyGpsWarp(observation) || accepted;
     }
     if (observation.metadata.timestamp_us > ekf_.timestampUs()) {
         gps_health_.noteRejected();
         return false;
     }
-    return applyGpsNow(observation, true);
+    accepted = applyGpsNow(observation, true);
+    return applyGpsWarp(observation) || accepted;
 }
 
 bool Localization::applyGpsNow(
@@ -245,6 +306,7 @@ bool Localization::applyGpsNow(
 {
     bool accepted = false;
     if (observation.position_valid) {
+        recordGpsResidual(observation);
         accepted = ekf_.updateGpsPosition(observation) || accepted;
     }
     if (observation.velocity_valid) {
@@ -283,6 +345,87 @@ bool Localization::applyGpsNow(
     return accepted;
 }
 
+void Localization::recordGpsResidual(const GpsObservation& observation)
+{
+    if (!observation.position_valid ||
+        observation.horizontal_accuracy_m >
+            config_.gps_warp_maximum_accuracy_m ||
+        observation.east_m < -config_.gps_warp_field_margin_m ||
+        observation.north_m < -config_.gps_warp_field_margin_m ||
+        observation.east_m >
+            config_.field_size_x_m + config_.gps_warp_field_margin_m ||
+        observation.north_m >
+            config_.field_size_y_m + config_.gps_warp_field_margin_m) {
+        return;
+    }
+    const float east = observation.east_m - ekf_.state()[POSITION_X];
+    const float north = observation.north_m - ekf_.state()[POSITION_Y];
+    const float distance = hypotf(east, north);
+    if (!isfinite(distance)) return;
+    if (distance < config_.gps_warp_residual_spread_m) {
+        gps_residual_count_ = 0;
+        gps_residual_write_ = 0;
+        return;
+    }
+    if (distance < config_.gps_warp_minimum_residual_m) return;
+    gps_residuals_[gps_residual_write_] = {east, north};
+    gps_residual_write_ = static_cast<uint8_t>(
+        (gps_residual_write_ + 1U) % 9U);
+    if (gps_residual_count_ < 9U) ++gps_residual_count_;
+}
+
+bool Localization::applyGpsWarp(const GpsObservation& observation)
+{
+    if (gps_residual_count_ < 9U ||
+        (gps_warp_timestamp_us_ != 0U &&
+         observation.metadata.received_us >= gps_warp_timestamp_us_ &&
+         observation.metadata.received_us - gps_warp_timestamp_us_ <
+            config_.gps_warp_cooldown_us)) {
+        return false;
+    }
+    float east_values[9]{};
+    float north_values[9]{};
+    for (uint8_t i = 0; i < 9U; ++i) {
+        east_values[i] = gps_residuals_[i].east_m;
+        north_values[i] = gps_residuals_[i].north_m;
+    }
+    const float east = median(east_values, 9U);
+    const float north = median(north_values, 9U);
+    if (hypotf(east, north) < config_.gps_warp_minimum_residual_m) {
+        return false;
+    }
+    uint8_t consistent = 0;
+    for (const GpsResidual& residual : gps_residuals_) {
+        if (hypotf(residual.east_m - east, residual.north_m - north) <=
+            config_.gps_warp_residual_spread_m) {
+            ++consistent;
+        }
+    }
+    if (consistent < 7U || !ekf_.shiftPosition(
+            east, north, observation.horizontal_accuracy_m)) {
+        return false;
+    }
+    for (uint16_t i = 0; i < history_count_; ++i) {
+        HistoryEntry& entry = historyAt(i);
+        entry.before.state[POSITION_X] += east;
+        entry.before.state[POSITION_Y] += north;
+    }
+    if (have_last_good_snapshot_) {
+        last_good_snapshot_.state[POSITION_X] += east;
+        last_good_snapshot_.state[POSITION_Y] += north;
+    }
+    gps_warp_timestamp_us_ = observation.metadata.received_us;
+    gps_warp_east_m_ = east;
+    gps_warp_north_m_ = north;
+    ++gps_warp_count_;
+    cycle_status_flags_ |= STATUS_GPS_WARPED;
+    fault_flags_ &= ~FAULT_GNSS_OUTLIER;
+    gps_health_.noteAccepted();
+    gps_residual_count_ = 0;
+    gps_residual_write_ = 0;
+    return true;
+}
+
 bool Localization::replayDelayedGps(const GpsObservation& observation)
 {
     if (history_count_ == 0U ||
@@ -295,9 +438,7 @@ bool Localization::replayDelayedGps(const GpsObservation& observation)
     uint16_t target = history_count_;
     for (uint16_t i = 0; i < history_count_; ++i) {
         const HistoryEntry& entry = historyAt(i);
-        const uint64_t end_us = entry.input.gyroscope.valid
-            ? entry.input.gyroscope.end_timestamp_us
-            : entry.before.timestamp_us;
+        const uint64_t end_us = entry.input.timestamp_us;
         if (observation.metadata.timestamp_us >= entry.before.timestamp_us &&
             observation.metadata.timestamp_us <= end_us) {
             target = i;
@@ -446,17 +587,31 @@ LocalizationEstimate Localization::estimate(uint64_t now_us)
         result.covariance[POSITION_X][POSITION_X],
         result.covariance[POSITION_Y][POSITION_Y]));
     const float yaw_std = sqrtf(result.covariance[YAW][YAW]);
-    const bool position_usable =
+    const bool position_source_available =
+        result.gps_health != SensorHealth::Failed ||
+        result.encoder_health != SensorHealth::Failed;
+    const bool gps_course_available =
+        result.gps_health != SensorHealth::Failed &&
+        result.gps_course_reject_reason == GpsCourseRejectReason::None;
+    const bool yaw_source_available =
+        result.imu_health != SensorHealth::Failed ||
+        result.encoder_health != SensorHealth::Failed ||
+        result.magnetic_health != SensorHealth::Failed ||
+        gps_course_available;
+    const bool position_usable = position_source_available &&
         position_std <= config_.maximum_position_std_m;
-    const bool yaw_usable =
-        ekf_.yawInitialized() && yaw_std <= config_.maximum_yaw_std_rad &&
-        result.imu_health != SensorHealth::Failed;
+    const bool yaw_usable = yaw_source_available &&
+        ekf_.yawInitialized() && yaw_std <= config_.maximum_yaw_std_rad;
     if (position_usable) result.status_flags |= STATUS_POSITION_USABLE;
     if (yaw_usable) result.status_flags |= STATUS_YAW_USABLE;
-    if (result.px_m < 0.0f || result.py_m < 0.0f ||
-        result.px_m > config_.field_size_x_m ||
-        result.py_m > config_.field_size_y_m) {
-        result.status_flags |= STATUS_OUTSIDE_FIELD;
+    result.gps_warp_count = gps_warp_count_;
+    result.gps_warp_timestamp_us = gps_warp_timestamp_us_;
+    result.gps_warp_east_m = gps_warp_east_m_;
+    result.gps_warp_north_m = gps_warp_north_m_;
+    if (gps_warp_timestamp_us_ != 0U &&
+        now_us >= gps_warp_timestamp_us_ &&
+        now_us - gps_warp_timestamp_us_ <= config_.gps_warp_status_hold_us) {
+        result.status_flags |= STATUS_GPS_WARPED;
     }
 
     const uint8_t failed_count =
@@ -466,8 +621,8 @@ LocalizationEstimate Localization::estimate(uint64_t now_us)
         (result.gps_health == SensorHealth::Failed ? 1U : 0U);
     if (!ekf_.covarianceValid()) {
         result.quality = Quality::Failed;
-    } else if (!position_usable || !yaw_usable || failed_count >= 3U) {
-        result.quality = Quality::Unreliable;
+    } else if (!position_usable || !yaw_usable) {
+        result.quality = Quality::Failed;
     } else if (failed_count > 0U) {
         result.quality = Quality::Degraded;
         result.status_flags |= STATUS_DEGRADED;
@@ -476,6 +631,10 @@ LocalizationEstimate Localization::estimate(uint64_t now_us)
     }
     result.valid = position_usable && yaw_usable &&
         result.quality != Quality::Failed;
+    if (result.valid && ekf_.covarianceValid()) {
+        last_good_snapshot_ = ekf_.snapshot();
+        have_last_good_snapshot_ = true;
+    }
     return result;
 }
 

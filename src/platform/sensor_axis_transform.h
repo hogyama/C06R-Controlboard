@@ -11,6 +11,7 @@ struct Vector3 {
 };
 
 // Domain body frame: X=forward, Y=left, Z=up.
+
 // The modules on ControlBoard are mounted to match this body frame.
 inline Vector3 boardImuToBody(float x, float y, float z)
 {

@@ -63,7 +63,8 @@ SystemCmdType convertTweCommand(Twe::Data command)
 
 void taskTwe(void *pvParameters) {
     constexpr TickType_t period = pdMS_TO_TICKS(100);
-    constexpr uint32_t TELEMETRY_PERIOD_MS = 1000;
+    constexpr uint32_t TELEMETRY_PERIOD_MS = 500;
+    constexpr uint32_t TELEMETRY_PAGE_GAP_MS = 100;
 
     // BootMode確定前はTWELITE用UARTを開始しない。
     holdTwePowerOff();
@@ -85,6 +86,9 @@ void taskTwe(void *pvParameters) {
 
     bool is_twe_power_on = false;
     uint32_t last_telemetry_ms = 0;
+    uint32_t page1_due_ms = 0;
+    bool page1_pending = false;
+    Twe::TelemetrySnapshot active_snapshot{};
     TickType_t last_wake = xTaskGetTickCount();
     while (true){
         xTaskDelayUntil(&last_wake, period);
@@ -99,6 +103,7 @@ void taskTwe(void *pvParameters) {
              status.state != SystemState::STATE_AWAIT_ASCENT &&
              status.state != SystemState::STATE_ASCENT_TO_LANDING);
         if (should_power_on != is_twe_power_on) {
+            page1_pending = false;
             if (should_power_on) is_twe_power_on = twe.powerOn();
             else {
                 twe.powerOff();
@@ -108,7 +113,6 @@ void taskTwe(void *pvParameters) {
         if(is_twe_power_on){
             twe.poll();
             Twe::Data data{};
-            Twe::TelemetryFrame frame{};
             // 受信
             Twe::MessageType msg_type = twe.readMsg(&data);
             if(msg_type == Twe::MessageType::Command){
@@ -141,11 +145,20 @@ void taskTwe(void *pvParameters) {
                     pdMS_TO_TICKS(20));
             }
             // 送信
-            if(xQueuePeek(mbx_twe_telemetry, &frame, 0) == pdTRUE){
-                const uint32_t now_ms = millis();
-                if(static_cast<uint32_t>(now_ms - last_telemetry_ms) >=
-                    TELEMETRY_PERIOD_MS){
-                    twe.sendTelemetry(frame);
+            const uint32_t now_ms = millis();
+            if (page1_pending &&
+                static_cast<int32_t>(now_ms - page1_due_ms) >= 0) {
+                twe.sendTelemetry(active_snapshot.sensors);
+                page1_pending = false;
+            }
+            if (!page1_pending &&
+                static_cast<uint32_t>(now_ms - last_telemetry_ms) >=
+                    TELEMETRY_PERIOD_MS &&
+                xQueuePeek(
+                    mbx_twe_telemetry, &active_snapshot, 0) == pdTRUE) {
+                if (twe.sendTelemetry(active_snapshot.navigation)) {
+                    page1_pending = true;
+                    page1_due_ms = now_ms + TELEMETRY_PAGE_GAP_MS;
                     last_telemetry_ms = now_ms;
                 }
             }

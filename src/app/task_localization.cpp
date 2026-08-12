@@ -160,6 +160,13 @@ Coordinate coordinateFromEstimate(
     coordinate.motion_anomaly_flags = estimate.anomaly_flags;
     coordinate.motion_anomaly_since_ms =
         static_cast<uint32_t>(estimate.anomaly_since_us / 1000ULL);
+    coordinate.gps_warp_count = estimate.gps_warp_count;
+    coordinate.gps_warp_timestamp_ms = static_cast<uint32_t>(
+        estimate.gps_warp_timestamp_us / 1000ULL);
+    coordinate.gps_warp_east_mm = static_cast<int32_t>(lroundf(
+        estimate.gps_warp_east_m * 1000.0f));
+    coordinate.gps_warp_north_mm = static_cast<int32_t>(lroundf(
+        estimate.gps_warp_north_m * 1000.0f));
     coordinate.is_first_gps_valid = estimate.initialized;
     if (gps.position_valid) {
         coordinate.gps_x_mm = static_cast<int32_t>(lroundf(gps.east_m * 1000.0f));
@@ -259,11 +266,13 @@ void taskLocalization(void* pvParameters)
             system.boot_mode != BootMode::DEBUG &&
             (system.state == SystemState::STATE_PRELAUNCH ||
              system.state == SystemState::STATE_AWAIT_ASCENT);
-        if ((sequence_reset && !sequence_reset_applied) ||
-            system.navigation_reset_count !=
-                observed_navigation_reset_count) {
+        const bool navigation_reset = system.navigation_reset_count !=
+            observed_navigation_reset_count;
+        if ((sequence_reset && !sequence_reset_applied) || navigation_reset) {
             observed_navigation_reset_count = system.navigation_reset_count;
-            localization.reset();
+            if (sequence_reset || !localization.recoverFromLastGood()) {
+                localization.reset();
+            }
             preprocessor.reset();
             preprocessor.setMagneticCalibration(magnetic_calibration);
             gyro_integrator.reset(now_us);
@@ -423,6 +432,7 @@ void taskLocalization(void* pvParameters)
         }
 
         CycleInput cycle{};
+        cycle.timestamp_us = now_us;
         cycle.gyroscope = gyro_integrator.finish(now_us);
         cycle.motor_command_active = motorCommandActive(now_ms);
         cycle.stationary = preprocessor.stationaryObservation(
@@ -471,23 +481,30 @@ void taskLocalization(void* pvParameters)
                 MagneticCalibrationResult::Collecting) {
             const bool success =
                 magnetic_calibrator.finish(magnetic_calibration);
-            debug_status.magnetic_calibration_last_success = success;
-            debug_status.magnetic_calibrating = false;
-            ++magnetic_calibration_generation;
-            if (success) {
-                preprocessor.setMagneticCalibration(magnetic_calibration);
-                for (uint8_t i = 0; i < 3; ++i) {
-                    char key[8]{};
-                    snprintf(key, sizeof(key), "mag_h%u", i);
-                    preferences.putFloat(
-                        key, magnetic_calibration.hard_iron_uT[i]);
-                    for (uint8_t j = 0; j < 3; ++j) {
-                        snprintf(key, sizeof(key), "mag_s%u%u", i, j);
+            if (magnetic_calibrator.active()) {
+                // Preliminary coverage can still be one-sided around the
+                // fitted hard-iron center. Keep collecting without reporting
+                // a failed calibration or requiring another start command.
+                debug_status.magnetic_calibrating = true;
+            } else {
+                debug_status.magnetic_calibration_last_success = success;
+                debug_status.magnetic_calibrating = false;
+                ++magnetic_calibration_generation;
+                if (success) {
+                    preprocessor.setMagneticCalibration(magnetic_calibration);
+                    for (uint8_t i = 0; i < 3; ++i) {
+                        char key[8]{};
+                        snprintf(key, sizeof(key), "mag_h%u", i);
                         preferences.putFloat(
-                            key, magnetic_calibration.soft_iron[i][j]);
+                            key, magnetic_calibration.hard_iron_uT[i]);
+                        for (uint8_t j = 0; j < 3; ++j) {
+                            snprintf(key, sizeof(key), "mag_s%u%u", i, j);
+                            preferences.putFloat(
+                                key, magnetic_calibration.soft_iron[i][j]);
+                        }
                     }
+                    preferences.putBool("mag_valid", true);
                 }
-                preferences.putBool("mag_valid", true);
             }
         }
 
@@ -616,6 +633,32 @@ void taskLocalization(void* pvParameters)
             latest_magnetic.metadata.source,
             magnetic_board_rate.rate_hz,
             magnetic_can_rate.rate_hz};
+        debug_status.magnetic_diagnostic_acceleration_source =
+            latest_acceleration.metadata.source;
+        debug_status.board_corrected_magnetic_valid = false;
+        debug_status.board_magnetic_yaw_valid = false;
+        debug_status.can_magnetic_yaw_valid = false;
+        if (Sensor::sampleIsFresh(
+                board_mag.metadata, now_us, config.magnetic_stale_us)) {
+            const MagneticDiagnostic diagnostic =
+                preprocessor.magneticDiagnostic(magneticToBody(board_mag));
+            for (uint8_t axis = 0; axis < 3U; ++axis) {
+                debug_status.board_corrected_magnetic_uT[axis] =
+                    diagnostic.corrected_uT[axis];
+            }
+            debug_status.board_corrected_magnetic_valid =
+                diagnostic.vector_valid && diagnostic.calibration_applied;
+            debug_status.board_magnetic_yaw_rad = diagnostic.heading_rad;
+            debug_status.board_magnetic_yaw_valid =
+                diagnostic.heading_valid && diagnostic.calibration_applied;
+        }
+        if (Sensor::sampleIsFresh(
+                can_mag.metadata, now_us, config.magnetic_stale_us)) {
+            const MagneticDiagnostic diagnostic =
+                preprocessor.magneticDiagnostic(magneticToBody(can_mag));
+            debug_status.can_magnetic_yaw_rad = diagnostic.heading_rad;
+            debug_status.can_magnetic_yaw_valid = diagnostic.heading_valid;
+        }
         debug_status.encoder_health = debugHealth(
             latest_encoder.metadata, now_us,
             config.encoder_stale_us, config.encoder_failed_us);
@@ -634,7 +677,28 @@ void taskLocalization(void* pvParameters)
         debug_status.magnetic_calibration_samples =
             magnetic_calibrator.sampleCount();
         debug_status.magnetic_calibration_target_samples =
-            MagneticCalibrator::SAMPLE_CAPACITY;
+            MagneticCalibrator::MINIMUM_SAMPLE_COUNT;
+        debug_status.magnetic_calibration_direction_bins =
+            magnetic_calibrator.directionBins();
+        debug_status.magnetic_calibration_target_direction_bins =
+            magnetic_calibrator.directionTargetBins();
+        debug_status.magnetic_calibration_current_direction =
+            magnetic_calibrator.currentDirectionBin();
+        for (uint8_t bin = 0;
+             bin < MagneticCalibrator::DIRECTION_BIN_COUNT; ++bin) {
+            debug_status.magnetic_calibration_direction_counts[bin] =
+                magnetic_calibrator.directionBinCount(bin);
+        }
+        debug_status.magnetic_calibration_progress_percent =
+            magnetic_calibrator.progressPercent();
+        debug_status.magnetic_calibration_need =
+            static_cast<uint8_t>(magnetic_calibrator.need());
+        for (uint8_t axis = 0; axis < 3; ++axis) {
+            debug_status.magnetic_calibration_axis_range_uT[axis] =
+                magnetic_calibrator.axisRangeUT(axis);
+        }
+        debug_status.magnetic_calibration_eigenvalue_ratio =
+            magnetic_calibrator.eigenvalueRatio();
         debug_status.magnetic_calibration_result =
             static_cast<uint8_t>(magnetic_calibrator.result());
         debug_status.magnetic_calibration_rms_uT =

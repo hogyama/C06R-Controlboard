@@ -19,6 +19,8 @@ struct Config {
     float encoder_velocity_std_m_s = 0.12f;
     float encoder_maximum_speed_m_s = 3.0f;
     float encoder_maximum_left_right_difference_m_s = 2.0f;
+    float encoder_track_width_m = 0.18f;
+    float encoder_yaw_noise_rad2_s = 0.01f;
     uint64_t encoder_minimum_interval_us = 2000;
     uint64_t encoder_maximum_interval_us = 300000;
 
@@ -36,6 +38,12 @@ struct Config {
     float gps_initial_maximum_accuracy_m = 5.0f;
     uint8_t gps_initial_minimum_fix_type = 3;
     uint8_t gps_initial_minimum_satellites = 6;
+    float gps_warp_maximum_accuracy_m = 3.0f;
+    float gps_warp_minimum_residual_m = 5.0f;
+    float gps_warp_residual_spread_m = 2.0f;
+    float gps_warp_field_margin_m = 5.0f;
+    uint64_t gps_warp_cooldown_us = 10000000;
+    uint64_t gps_warp_status_hold_us = 1000000;
 
     float mahalanobis_gate_1d = 10.83f;
     float mahalanobis_gate_2d = 13.82f;
@@ -57,8 +65,9 @@ struct Config {
     uint64_t gps_stale_us = 2500000;
     uint64_t gps_failed_us = 10000000;
 
-    uint16_t health_failure_rejections = 5;
-    uint16_t health_recovery_accepts = 10;
+    uint16_t health_failure_rejections = UINT16_MAX;
+    uint16_t health_recovery_accepts = 4;
+    uint64_t health_rejection_failure_us = 1500000;
 
     float maximum_position_std_m = 12.0f;
     float maximum_yaw_std_rad = 0.8f;

@@ -45,7 +45,18 @@ SrvGps::SrvGps()
       last_ubx_configuration_ms(0),
       navigation_time_reference_valid(false),
       previous_navigation_itow_ms(0),
-       previous_navigation_timestamp_us(0)
+      previous_navigation_timestamp_us(0),
+      last_uart_activity_ms(0),
+      last_nav_pvt_ms(0),
+      startup_grace_until_ms(0),
+      recovery_power_on_due_ms(0),
+      recovery_cooldown_until_ms(0),
+      last_watchdog_configuration_ms(0),
+      checksum_failure_count(0),
+      power_cycle_count(0),
+      configuration_retry_count(0),
+      consecutive_power_cycles(0),
+      watchdog_configuration_attempts(0)
 {
 }
 
@@ -150,6 +161,14 @@ bool SrvGps::powerOn()
     nav_pvt_observation_available = false;
     ubx_configuration_sent = false;
     gps_power_on_time_ms = millis();
+    last_uart_activity_ms = gps_power_on_time_ms;
+    last_nav_pvt_ms = gps_power_on_time_ms;
+    startup_grace_until_ms = gps_power_on_time_ms + STARTUP_GRACE_MS;
+    recovery_power_on_due_ms = 0;
+    recovery_cooldown_until_ms = 0;
+    last_watchdog_configuration_ms = 0;
+    consecutive_power_cycles = 0;
+    watchdog_configuration_attempts = 0;
     last_ubx_configuration_ms = 0;
     navigation_time_reference_valid = false;
     previous_navigation_itow_ms = 0;
@@ -174,29 +193,96 @@ void SrvGps::powerOff()
     previous_navigation_itow_ms = 0;
     previous_navigation_timestamp_us = 0;
     status = Status::Dead;
+    recovery_power_on_due_ms = 0;
+    recovery_cooldown_until_ms = 0;
+    consecutive_power_cycles = 0;
+    watchdog_configuration_attempts = 0;
+}
+
+void SrvGps::schedulePowerCycle(uint32_t now_ms)
+{
+    if (recovery_cooldown_until_ms != 0U &&
+        static_cast<int32_t>(now_ms - recovery_cooldown_until_ms) < 0) {
+        status = Status::Failed;
+        return;
+    }
+    if (consecutive_power_cycles >= MAX_CONSECUTIVE_POWER_CYCLES) {
+        if (recovery_cooldown_until_ms == 0U) {
+            status = Status::Failed;
+            recovery_cooldown_until_ms = now_ms + RECOVERY_COOLDOWN_MS;
+            return;
+        }
+        consecutive_power_cycles = 0;
+        recovery_cooldown_until_ms = 0;
+    }
+    stopUart();
+    digitalWrite(gps_enable_pin, LOW);
+    gps_power_on = false;
+    is_valid = false;
+    nav_pvt_observation_available = false;
+    status = Status::Recovering;
+    recovery_power_on_due_ms = now_ms + POWER_OFF_RECOVERY_MS;
+    ++consecutive_power_cycles;
+    ++power_cycle_count;
+}
+
+bool SrvGps::restoreRecoveryPower(uint32_t now_ms)
+{
+    if (status != Status::Recovering || recovery_power_on_due_ms == 0U ||
+        static_cast<int32_t>(now_ms - recovery_power_on_due_ms) < 0) {
+        return false;
+    }
+    digitalWrite(gps_enable_pin, HIGH);
+    if (!startUart()) {
+        digitalWrite(gps_enable_pin, LOW);
+        status = Status::Failed;
+        recovery_cooldown_until_ms = now_ms + RECOVERY_COOLDOWN_MS;
+        return false;
+    }
+    gps_power_on = true;
+    status = Status::Searching;
+    gps_power_on_time_ms = now_ms;
+    last_uart_activity_ms = now_ms;
+    last_nav_pvt_ms = now_ms;
+    startup_grace_until_ms = now_ms + STARTUP_GRACE_MS;
+    recovery_power_on_due_ms = 0;
+    last_ubx_configuration_ms = 0;
+    last_watchdog_configuration_ms = 0;
+    watchdog_configuration_attempts = 0;
+    ubx_configuration_sent = false;
+    navigation_time_reference_valid = false;
+    resetUbxParser();
+    return true;
 }
 
 void SrvGps::poll()
 {
-    if (!is_gps_initialized || !gps_power_on){
+    const uint32_t now_ms = millis();
+    if (!is_gps_initialized) {
         // GPSが初期化されていない、または電源が入っていない場合は、ステータスをDeadにする
         status = Status::Dead;
+        return;
+    }
+    if (!gps_power_on) {
+        if (status == Status::Failed &&
+            recovery_cooldown_until_ms != 0U &&
+            static_cast<int32_t>(now_ms - recovery_cooldown_until_ms) >= 0) {
+            status = Status::Recovering;
+            recovery_power_on_due_ms = now_ms;
+            recovery_cooldown_until_ms = 0;
+        }
+        restoreRecoveryPower(now_ms);
         return;
     }
 
     // MAX-M10Sの起動完了を待ち、RAM設定だけを毎回適用する。
     // UART出力をUBX-NAV-PVTだけに設定する。
-    const uint32_t now_ms = millis();
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
-    const bool nav_pvt_missing_or_stale =
-        !nav_pvt_observation_available ||
-        receivedAgeMs(nav_pvt_observation, now_us) >= VALID_TIMEOUT_MS;
-    const bool configuration_retry_due =
-        nav_pvt_missing_or_stale &&
-        (last_ubx_configuration_ms == 0U ||
-         static_cast<uint32_t>(now_ms - last_ubx_configuration_ms) >= 2000U);
     if (static_cast<uint32_t>(now_ms - gps_power_on_time_ms) >= 500U &&
-        (!ubx_configuration_sent || configuration_retry_due)) {
+        !ubx_configuration_sent &&
+        (last_ubx_configuration_ms == 0U ||
+         static_cast<uint32_t>(
+             now_ms - last_ubx_configuration_ms) >= 2000U)) {
         ubx_configuration_sent = configureMaxM10s();
         last_ubx_configuration_ms = now_ms;
     }
@@ -208,6 +294,7 @@ void SrvGps::poll()
         if (len <= 0) {
             break; // 読み切ったのでループを抜ける
         }
+        last_uart_activity_ms = now_ms;
         for (int i = 0; i < len; i++) {
             parseUbxByte(gps_buffer[i]);
         }
@@ -223,6 +310,44 @@ void SrvGps::poll()
     const bool nav_pvt_fresh =
         nav_pvt_observation_available &&
         receivedAgeMs(nav_pvt_observation, status_now_us) < VALID_TIMEOUT_MS;
+    if (nav_pvt_fresh) {
+        consecutive_power_cycles = 0;
+        watchdog_configuration_attempts = 0;
+        recovery_cooldown_until_ms = 0;
+    }
+
+    const bool grace_finished =
+        static_cast<int32_t>(now_ms - startup_grace_until_ms) >= 0;
+    const bool uart_silent =
+        static_cast<uint32_t>(now_ms - last_uart_activity_ms) >=
+            RECEIVER_SILENCE_TIMEOUT_MS;
+    const bool nav_pvt_silent =
+        static_cast<uint32_t>(now_ms - last_nav_pvt_ms) >=
+            RECEIVER_SILENCE_TIMEOUT_MS;
+    if (grace_finished && !nav_pvt_fresh) {
+        if (uart_silent) {
+            schedulePowerCycle(now_ms);
+            return;
+        }
+        // UART activity without NAV-PVT includes valid non-PVT UBX and
+        // continuous corrupt bytes. Reconfigure once, then power-cycle if
+        // NAV-PVT still does not recover.
+        if (nav_pvt_silent) {
+            if (watchdog_configuration_attempts == 0U) {
+                resetUbxParser();
+                ubx_configuration_sent = configureMaxM10s();
+                last_watchdog_configuration_ms = now_ms;
+                ++watchdog_configuration_attempts;
+                ++configuration_retry_count;
+            } else if (static_cast<uint32_t>(
+                    now_ms - last_watchdog_configuration_ms) >=
+                    RECEIVER_SILENCE_TIMEOUT_MS) {
+                schedulePowerCycle(now_ms);
+                return;
+            }
+        }
+    }
+
     if (!nav_pvt_fresh) {
         status = Status::Dead;
     } else if (is_valid) {
@@ -341,6 +466,8 @@ void SrvGps::parseUbxByte(uint8_t value)
             if (ubx_received_checksum_a == ubx_checksum_a &&
                 value == ubx_checksum_b) {
                 handleUbxFrame();
+            } else {
+                ++checksum_failure_count;
             }
             resetUbxParser();
             break;
@@ -417,6 +544,7 @@ void SrvGps::handleUbxFrame()
         (flags & 0x01U) != 0U && fix_type >= 2U;
     nav_pvt_observation.metadata.valid = nav_pvt_observation.fix_ok;
     nav_pvt_observation_available = true;
+    last_nav_pvt_ms = millis();
 }
 
 bool SrvGps::sendUbx(uint8_t message_class,

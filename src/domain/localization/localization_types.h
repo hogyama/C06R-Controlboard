@@ -70,7 +70,7 @@ enum StatusFlag : uint16_t {
     STATUS_GPS_UNHEALTHY       = 1U << 12,
     STATUS_MAGNETIC_UNHEALTHY  = 1U << 13,
     STATUS_ENCODER_UNHEALTHY   = 1U << 14,
-    STATUS_OUTSIDE_FIELD       = 1U << 15
+    STATUS_GPS_WARPED          = 1U << 15
 };
 
 enum ActiveSensorFlag : uint32_t {
@@ -136,6 +136,11 @@ struct EncoderVelocityObservation {
     float velocity_m_s;
     float left_velocity_m_s;
     float right_velocity_m_s;
+    float delta_distance_m;
+    float delta_yaw_rad;
+    float yaw_rate_rad_s;
+    float yaw_variance_rad2;
+    uint64_t interval_us;
     float variance_m2_s2;
     Sensor::SampleMetadata metadata;
     bool valid;
@@ -203,6 +208,10 @@ struct LocalizationEstimate {
     GpsCourseRejectReason gps_course_reject_reason;
     uint16_t anomaly_flags;
     uint64_t anomaly_since_us;
+    uint32_t gps_warp_count;
+    uint64_t gps_warp_timestamp_us;
+    float gps_warp_east_m;
+    float gps_warp_north_m;
     bool initialized;
     bool valid;
 };

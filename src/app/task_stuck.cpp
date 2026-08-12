@@ -28,6 +28,7 @@ constexpr uint32_t VERIFY_FRAME_TIMEOUT_MS = 5000;
 constexpr uint32_t VERIFY_PROBE_MS = 1000;
 constexpr uint32_t VERIFY_COMMAND_MS = 300;
 constexpr uint32_t VERIFY_COOLDOWN_MS = 5000;
+constexpr uint32_t VERIFY_TOTAL_TIMEOUT_MS = 20000;
 constexpr int16_t VERIFY_TRANSLATION_MM_S = 220;
 constexpr int16_t VERIFY_ROTATION_X100 = 40;
 constexpr uint8_t VERIFY_HASH_SAMPLES = 3;
@@ -209,15 +210,7 @@ struct RecurrenceTracker {
     }
 };
 
-enum class VerifyPhase : uint8_t {
-    Idle,
-    WaitSuspend,
-    SettleBefore,
-    CaptureBefore,
-    Probe,
-    SettleAfter,
-    CaptureAfter
-};
+using VerifyPhase = StuckVerificationPhase;
 
 struct VerificationContext {
     VerifyPhase phase = VerifyPhase::Idle;
@@ -225,6 +218,7 @@ struct VerificationContext {
     int8_t translation_direction = 1;
     int8_t rotation_direction = 1;
     uint32_t phase_started_ms = 0;
+    uint32_t verification_started_ms = 0;
     uint32_t cooldown_until_ms = 0;
     uint8_t attempt = 0;
     uint8_t stuck_votes = 0;
@@ -533,8 +527,7 @@ void taskStuck(void *pvParameters)
         StuckDiagnostics diagnostics{};
         diagnostics.timestamp_ms = now_ms;
         diagnostics.scores = detector.scores();
-        diagnostics.verification_phase =
-            static_cast<uint8_t>(verification.phase);
+        diagnostics.verification_phase = verification.phase;
         diagnostics.trigger_reason = verification.reason;
         for (uint8_t i = 0; i < 3U; ++i) {
             diagnostics.recurrence_count[i] =
@@ -621,8 +614,12 @@ void taskStuck(void *pvParameters)
 
         auto finishInconclusive = [&]() {
             const uint8_t slot = reasonSlot(verification.reason);
-            if (verification.reason == StuckReason::WheelSlip &&
-                slot < 3U && recurrence[slot].escapeRequired(now_ms)) {
+            const bool no_independent_evidence =
+                !encoder_available && !gyro_available &&
+                !acceleration_available && !gps_available;
+            if (no_independent_evidence ||
+                (verification.reason == StuckReason::WheelSlip &&
+                 slot < 3U && recurrence[slot].escapeRequired(now_ms))) {
                 publishConfirmed(verification.reason);
             } else {
                 rejectVerification(false);
@@ -646,6 +643,14 @@ void taskStuck(void *pvParameters)
         };
 
         if (verification.phase != VerifyPhase::Idle) {
+            if (verification.verification_started_ms != 0U &&
+                static_cast<uint32_t>(
+                    now_ms - verification.verification_started_ms) >=
+                    VERIFY_TOTAL_TIMEOUT_MS) {
+                publishVerificationMotion(0, 0);
+                publishConfirmed(verification.reason);
+                continue;
+            }
             if (verification.phase == VerifyPhase::WaitSuspend) {
                 if (suspend_active) {
                     verification.phase = VerifyPhase::SettleBefore;
@@ -1046,6 +1051,7 @@ void taskStuck(void *pvParameters)
             sample.command_yaw_rate_rad_s < 0.0f ? -1 : 1;
         verification.phase = VerifyPhase::WaitSuspend;
         verification.phase_started_ms = now_ms;
+        verification.verification_started_ms = now_ms;
         publishVerificationMotion(0, 0);
         requestSystemState(SystemCmdType::RequestStuckSuspend);
     }

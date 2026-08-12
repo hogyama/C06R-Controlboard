@@ -254,6 +254,38 @@ void testMagneticPreprocessorAndStationaryGate()
         preprocessor.processMagnetic(magnetic);
     expect(heading.valid && std::fabs(heading.heading_rad) < 0.01f,
            "magnetic east-zero heading");
+
+    MagneticCalibration calibration{};
+    calibration.hard_iron_uT[0] = 10.0f;
+    calibration.hard_iron_uT[1] = -5.0f;
+    calibration.hard_iron_uT[2] = 20.0f;
+    calibration.valid = true;
+    preprocessor.setMagneticCalibration(calibration);
+    magnetic.x_uT = 10.0f;
+    magnetic.y_uT = 35.0f;
+    magnetic.z_uT = 20.0f;
+    const MagneticDiagnostic diagnostic =
+        preprocessor.magneticDiagnostic(magnetic);
+    expect(diagnostic.vector_valid && diagnostic.calibration_applied,
+           "board magnetic diagnostic applies calibration");
+    expect(std::fabs(diagnostic.corrected_uT[0]) < 0.01f &&
+               std::fabs(diagnostic.corrected_uT[1] - 40.0f) < 0.01f &&
+               std::fabs(diagnostic.corrected_uT[2]) < 0.01f,
+           "board corrected magnetic vector");
+    expect(diagnostic.heading_valid &&
+               std::fabs(diagnostic.heading_rad) < 0.01f,
+           "diagnostic heading is available before localization");
+    magnetic.x_uT = 40.0f;
+    magnetic.y_uT = 0.0f;
+    magnetic.z_uT = 0.0f;
+    magnetic.metadata.source = Sensor::Source::Can;
+    const MagneticDiagnostic can_diagnostic =
+        preprocessor.magneticDiagnostic(magnetic);
+    expect(can_diagnostic.heading_valid &&
+               !can_diagnostic.calibration_applied &&
+               std::fabs(can_diagnostic.heading_rad -
+                   1.57079632679f) < 0.01f,
+           "CAN magnetic diagnostic bypasses BOARD calibration");
     magnetic.x_uT = 1000.0f;
     magnetic.y_uT = 1000.0f;
     expect(!preprocessor.processMagnetic(magnetic).valid,
@@ -295,6 +327,74 @@ void testLongRunCovarianceAndTimeout()
            "gps timeout fault flag");
 }
 
+void testEncoderYawFallback()
+{
+    Localization localization;
+    GpsObservation initial = gps(1000000U, 30.0f, 30.0f);
+    MagneticHeadingObservation heading{};
+    heading.heading_rad = 0.0f;
+    heading.variance_rad2 = 0.04f;
+    heading.metadata = {
+        1000000U, 1000000U, Sensor::Source::BoardI2c, true};
+    heading.valid = true;
+    expect(localization.initializeFromGps(initial, &heading, 0.0f),
+           "encoder fallback initialize");
+
+    EncoderVelocityObservation wheels{};
+    wheels.velocity_m_s = 0.09f;
+    wheels.left_velocity_m_s = 0.0f;
+    wheels.right_velocity_m_s = 0.18f;
+    wheels.delta_distance_m = 0.009f;
+    wheels.delta_yaw_rad = 0.1f;
+    wheels.yaw_rate_rad_s = 1.0f;
+    wheels.yaw_variance_rad2 = 0.001f;
+    wheels.interval_us = 100000U;
+    wheels.variance_m2_s2 = 0.01f;
+    wheels.metadata = {
+        1100000U, 1100000U, Sensor::Source::Can, true};
+    wheels.valid = true;
+    CycleInput input{};
+    input.timestamp_us = 1100000U;
+    input.encoder = wheels;
+    input.has_encoder = true;
+    expect(localization.processCycle(input),
+           "encoder predicts without gyro");
+    expect(localization.ekf().state()[YAW] > 0.05f,
+           "encoder differential updates yaw");
+}
+
+void testConsistentGpsWarp()
+{
+    Config config{};
+    config.mahalanobis_gate_2d = 0.1f;
+    Localization localization(config);
+    GpsObservation initial = gps(1000000U, 30.0f, 30.0f);
+    MagneticHeadingObservation heading{};
+    heading.heading_rad = 0.0f;
+    heading.variance_rad2 = 0.04f;
+    heading.metadata = {
+        1000000U, 1000000U, Sensor::Source::BoardI2c, true};
+    heading.valid = true;
+    expect(localization.initializeFromGps(initial, &heading, 0.0f),
+           "warp initialize");
+
+    uint64_t timestamp_us = 1000000U;
+    for (uint8_t i = 0; i < 9U; ++i) {
+        CycleInput input{};
+        input.timestamp_us = timestamp_us + 100000U;
+        input.gyroscope = gyro(timestamp_us, input.timestamp_us, 0.0f);
+        localization.processCycle(input);
+        timestamp_us = input.timestamp_us;
+        localization.processGps(gps(timestamp_us, 40.0f, 30.0f));
+    }
+    const LocalizationEstimate estimate = localization.estimate(timestamp_us);
+    expect(estimate.gps_warp_count == 1U, "gps warp majority trigger");
+    expect(std::fabs(estimate.px_m - 40.0f) < 1.0f,
+           "gps warp shifts position only");
+    expect(std::fabs(estimate.theta_rad) < 0.1f,
+           "gps warp preserves yaw");
+}
+
 } // namespace
 
 int main()
@@ -307,6 +407,8 @@ int main()
     testEncoderPreprocessorAndMissingFrame();
     testMagneticPreprocessorAndStationaryGate();
     testLongRunCovarianceAndTimeout();
+    testEncoderYawFallback();
+    testConsistentGpsWarp();
     std::puts("localization_ekf_test: PASS");
     return 0;
 }

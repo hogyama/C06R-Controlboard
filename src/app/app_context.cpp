@@ -18,7 +18,7 @@ SrvFlash flash(
     FieldConfig::GOAL_LATITUDE_E7,
     FieldConfig::GOAL_LONGITUDE_E7);
 AStar::Work astar_work;
-AStar::GridPos grid_path[128];
+AStar::GridPos grid_path[AStar::CELL_COUNT];
 PurePursuit::Point pp_path[128];
 size_t pp_path_count = 0;
 

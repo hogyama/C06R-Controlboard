@@ -125,6 +125,26 @@ enum class NavigationRecoveryPhase : uint8_t {
     Stabilizing
 };
 
+enum class PathMode : uint8_t {
+    None = 0,
+    AStarNormal,
+    AStarRelaxed,
+    AStarEmergency,
+    AStarChunked,
+    DirectFallback,
+    FieldRecovery
+};
+
+enum class StuckVerificationPhase : uint8_t {
+    Idle = 0,
+    WaitSuspend,
+    SettleBefore,
+    CaptureBefore,
+    Probe,
+    SettleAfter,
+    CaptureAfter
+};
+
 // 候補指令はすべてArbiterへ送り、CAN用mailboxを直接上書きしない。
 enum class MotionCommandSource : uint8_t {
     Stop = 0,
@@ -201,6 +221,10 @@ struct Coordinate {
     Domain::Localization::GpsCourseRejectReason gps_course_reject_reason;
     uint16_t motion_anomaly_flags;
     uint32_t motion_anomaly_since_ms;
+    uint32_t gps_warp_count;
+    uint32_t gps_warp_timestamp_ms;
+    int32_t gps_warp_east_mm;
+    int32_t gps_warp_north_mm;
 
     bool is_first_gps_valid; // 最初にGPSが有効にならないと、ゴールとの位置関係が全く分からないため
 };
@@ -242,14 +266,29 @@ struct LocalizationDebugStatus {
     float magnetic_hard_iron_uT[3];
     float magnetic_soft_iron[3][3];
     float magnetic_calibration_rms_uT;
+    float magnetic_calibration_axis_range_uT[3];
+    float magnetic_calibration_eigenvalue_ratio;
     uint32_t magnetic_calibration_samples;
     uint32_t magnetic_calibration_generation;
     uint32_t magnetic_reset_generation;
     uint16_t magnetic_calibration_target_samples;
+    uint8_t magnetic_calibration_direction_counts[26];
+    uint8_t magnetic_calibration_direction_bins;
+    uint8_t magnetic_calibration_target_direction_bins;
+    uint8_t magnetic_calibration_current_direction;
+    uint8_t magnetic_calibration_progress_percent;
+    uint8_t magnetic_calibration_need;
     uint8_t magnetic_calibration_result;
     bool magnetic_calibrating;
     bool magnetic_calibration_last_success;
     bool magnetic_calibration_valid;
+    float board_corrected_magnetic_uT[3];
+    float board_magnetic_yaw_rad;
+    float can_magnetic_yaw_rad;
+    Sensor::Source magnetic_diagnostic_acceleration_source;
+    bool board_corrected_magnetic_valid;
+    bool board_magnetic_yaw_valid;
+    bool can_magnetic_yaw_valid;
     uint64_t timestamp_us;
 };
 
@@ -268,6 +307,7 @@ struct NavigationProgress {
     uint32_t path_revision;
     uint16_t nearest_index;
     uint16_t target_index;
+    PathMode path_mode;
     float distance_to_goal_mm;
     bool valid;
 };
@@ -287,7 +327,7 @@ struct StuckStatus {
 struct StuckDiagnostics {
     uint32_t timestamp_ms;
     Domain::Motion::StuckScores scores;
-    uint8_t verification_phase;
+    StuckVerificationPhase verification_phase;
     StuckReason trigger_reason;
     uint8_t recurrence_count[3];
     uint8_t verification_attempt;

@@ -26,7 +26,9 @@ public:
     enum class Status : uint8_t {
         Dead = 0,
         Searching,
-        Fix
+        Fix,
+        Recovering,
+        Failed
     };
 
     SrvGps();
@@ -36,6 +38,9 @@ public:
     void powerOff();
     void poll();
     Status getStatus() const { return status; }
+    uint32_t uartChecksumFailureCount() const { return checksum_failure_count; }
+    uint32_t powerCycleCount() const { return power_cycle_count; }
+    uint32_t configurationRetryCount() const { return configuration_retry_count; }
     bool getNavPvtObservation(Gps::NavPvtObservation* observation_out) const;
 
 private:
@@ -55,6 +60,11 @@ private:
     static constexpr uint32_t VALID_TIMEOUT_MS = 2000;
     static constexpr uint32_t GPS_WEEK_MS = 604800000;
     static constexpr uint32_t NAV_PVT_TRANSPORT_DELAY_MS = 120;
+    static constexpr uint32_t RECEIVER_SILENCE_TIMEOUT_MS = 8000;
+    static constexpr uint32_t STARTUP_GRACE_MS = 15000;
+    static constexpr uint32_t POWER_OFF_RECOVERY_MS = 1500;
+    static constexpr uint32_t RECOVERY_COOLDOWN_MS = 60000;
+    static constexpr uint8_t MAX_CONSECUTIVE_POWER_CYCLES = 2;
 
     bool is_gps_initialized;
     bool gps_power_on;
@@ -85,6 +95,17 @@ private:
     bool navigation_time_reference_valid;
     uint32_t previous_navigation_itow_ms;
     uint64_t previous_navigation_timestamp_us;
+    uint32_t last_uart_activity_ms;
+    uint32_t last_nav_pvt_ms;
+    uint32_t startup_grace_until_ms;
+    uint32_t recovery_power_on_due_ms;
+    uint32_t recovery_cooldown_until_ms;
+    uint32_t last_watchdog_configuration_ms;
+    uint32_t checksum_failure_count;
+    uint32_t power_cycle_count;
+    uint32_t configuration_retry_count;
+    uint8_t consecutive_power_cycles;
+    uint8_t watchdog_configuration_attempts;
 
     bool startUart();
     void stopUart();
@@ -92,6 +113,8 @@ private:
     void resetUbxParser();
     void handleUbxFrame();
     bool configureMaxM10s();
+    void schedulePowerCycle(uint32_t now_ms);
+    bool restoreRecoveryPower(uint32_t now_ms);
     bool sendUbx(uint8_t message_class,
                  uint8_t message_id,
                  const uint8_t* payload,

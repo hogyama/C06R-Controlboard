@@ -24,6 +24,7 @@ struct Output {
     float omega_rad_s = 0.0f;
     uint16_t duration_ms = 300;
     bool goal_reached = false;
+    bool link_lost = false;
 };
 
 void reset();

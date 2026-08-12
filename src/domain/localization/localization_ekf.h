@@ -34,6 +34,8 @@ public:
     const float (*covariance() const)[STATE_COUNT] { return covariance_; }
 
     bool predict(const GyroPreintegration& integration);
+    bool predictEncoderMotion(const EncoderVelocityObservation& observation);
+    bool predictCoast(uint64_t end_timestamp_us);
     bool updateEncoderVelocity(const EncoderVelocityObservation& observation);
     bool updateMagneticHeading(const MagneticHeadingObservation& observation);
     bool updateGpsPosition(const GpsObservation& observation);
@@ -41,6 +43,7 @@ public:
     bool updateZeroVelocity(float variance_m2_s2);
     bool updateZaru(float measured_gyro_z_rad_s, float variance_rad2_s2);
     bool setGyroBias(float bias_rad_s, float variance_rad2_s2);
+    bool shiftPosition(float east_m, float north_m, float position_std_m);
 
     float lastMahalanobis() const { return last_mahalanobis_; }
     bool covarianceValid() const { return covariance_valid_; }
@@ -67,6 +70,13 @@ private:
         const float variance[MAX_MEASUREMENT_DIMENSION],
         uint8_t dimension,
         float gate);
+    bool predictOdometry(
+        uint64_t end_timestamp_us,
+        float distance_m,
+        float delta_yaw_rad,
+        float distance_variance_m2,
+        float yaw_variance_rad2,
+        bool distance_from_velocity);
     void stabilizeCovariance();
 };
 

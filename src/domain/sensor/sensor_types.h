@@ -49,6 +49,12 @@ struct AcquisitionStats {
     uint8_t accel_samples;
     uint8_t magnetic_samples;
     uint16_t fifo_overflow_count;
+    float latest_gyro_x_rad_s;
+    float latest_gyro_y_rad_s;
+    float latest_gyro_z_rad_s;
+    float integrated_gyro_z_rad;
+    float minimum_gyro_z_rad_s;
+    float maximum_gyro_z_rad_s;
     SampleMetadata metadata;
 };
 

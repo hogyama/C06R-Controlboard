@@ -21,7 +21,7 @@ extern uint32_t grid_map_update_count;
 extern AStar::Work astar_work;
 
 // 経路出力用
-extern AStar::GridPos grid_path[128];
+extern AStar::GridPos grid_path[AStar::CELL_COUNT];
 extern PurePursuit::Point pp_path[128];
 extern size_t pp_path_count;
 

@@ -83,19 +83,32 @@ void SrvTwe::end() {
     initialized_ = false;
 }
 
-bool SrvTwe::sendTelemetry(const Twe::TelemetryFrame& frame)
+bool SrvTwe::sendTelemetryRaw(
+    const void* frame, size_t frame_size, uint16_t message_number)
 {
-    if (!initialized_ || !uart_active_) {
+    if (!initialized_ || !uart_active_ || frame == nullptr ||
+        frame_size > HAL_TWE_USER_DATA_MAX_LEN - 2U) {
         return false;
     }
     // message_numberが0の場合は送信しない(1から65535までの範囲で送信する) 
-    if (frame.message_number == 0) {
+    if (message_number == 0) {
         return false;
     }
-    uint8_t payload[1 + sizeof(Twe::TelemetryFrame)] = {0};
+    uint8_t payload[HAL_TWE_USER_DATA_MAX_LEN - 1U] = {0};
     payload[0] = static_cast<uint8_t>(Twe::MessageType::Telemetry); // msg_type
-    memcpy(&payload[1], &frame, sizeof(Twe::TelemetryFrame));
-    return hal_twe.sendto(HAL_TWE_LID_PARENT, payload, sizeof(Twe::TelemetryFrame) + 1);
+    memcpy(&payload[1], frame, frame_size);
+    return hal_twe.sendto(
+        HAL_TWE_LID_PARENT, payload, static_cast<uint8_t>(frame_size + 1U));
+}
+
+bool SrvTwe::sendTelemetry(const Twe::TelemetryPage0& frame)
+{
+    return sendTelemetryRaw(&frame, sizeof(frame), frame.message_number);
+}
+
+bool SrvTwe::sendTelemetry(const Twe::TelemetryPage1& frame)
+{
+    return sendTelemetryRaw(&frame, sizeof(frame), frame.message_number);
 }
 
 static bool isValidTweCommandType(uint8_t msg_type)

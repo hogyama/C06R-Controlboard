@@ -1,6 +1,7 @@
 #include "tasks.h"
 #include "app_types.h"
 #include "app_queue.h"
+#include "domain/localization/magnetic_calibrator.h"
 #include "service/Can/srv_can.h"
 
 #include <Arduino.h>
@@ -51,6 +52,50 @@ const char* magneticCalibrationResultName(uint8_t result)
     }
 }
 
+const char* magneticCalibrationNeedName(uint8_t need)
+{
+    switch (need) {
+        case 0: return "NONE";
+        case 1: return "SAMPLES";
+        case 2: return "DIRECTIONS";
+        case 3: return "RANGE_X";
+        case 4: return "RANGE_Y";
+        case 5: return "RANGE_Z";
+        case 6: return "DISTRIBUTION";
+        case 7: return "FIT_RETRY";
+        case 8: return "FIT_QUALITY";
+        default: return "UNKNOWN";
+    }
+}
+
+void magneticDirectionName(uint8_t bin, char* output, size_t size)
+{
+    if (output == nullptr || size == 0U) return;
+    output[0] = '\0';
+    if (bin >= 26U) {
+        snprintf(output, size, "NONE");
+        return;
+    }
+    const uint8_t code = bin < 13U ? bin : static_cast<uint8_t>(bin + 1U);
+    const int8_t direction[3] = {
+        static_cast<int8_t>(static_cast<int>(code / 9U) - 1),
+        static_cast<int8_t>(static_cast<int>((code / 3U) % 3U) - 1),
+        static_cast<int8_t>(static_cast<int>(code % 3U) - 1)};
+    const char* names[3] = {
+        direction[0] > 0 ? "FRONT" : (direction[0] < 0 ? "BACK" : ""),
+        direction[1] > 0 ? "LEFT" : (direction[1] < 0 ? "RIGHT" : ""),
+        direction[2] > 0 ? "UP" : (direction[2] < 0 ? "DOWN" : "")};
+    size_t used = 0;
+    for (uint8_t axis = 0; axis < 3U; ++axis) {
+        if (names[axis][0] == '\0') continue;
+        const int written = snprintf(
+            output + used, size - used, "%s%s",
+            used == 0U ? "" : "+", names[axis]);
+        if (written < 0 || static_cast<size_t>(written) >= size - used) break;
+        used += static_cast<size_t>(written);
+    }
+}
+
 const char* healthName(Domain::Localization::SensorHealth health)
 {
     using Domain::Localization::SensorHealth;
@@ -72,6 +117,17 @@ const char* sourceName(Sensor::Source source)
         case Sensor::Source::None: return "NONE";
     }
     return "NONE";
+}
+
+float headingDegrees(float radians)
+{
+    return radians * 180.0f / static_cast<float>(M_PI);
+}
+
+float compassDegrees(float radians)
+{
+    float degrees = fmodf(90.0f - headingDegrees(radians), 360.0f);
+    return degrees < 0.0f ? degrees + 360.0f : degrees;
 }
 
 int8_t decodeFileIndex(char command)
@@ -184,6 +240,23 @@ void printSensorStatus()
     serialPrintfLine(
         "$SENSOR,PRESSURE,active=CAN,health=%s,rate_hz=%.1f",
         healthName(status.pressure_health), status.pressure_rate_hz);
+    serialPrintfLine(
+        "$MAG_DIAG,acc_source=%s,calibration_valid=%u",
+        sourceName(status.magnetic_diagnostic_acceleration_source),
+        status.magnetic_calibration_valid ? 1U : 0U);
+    serialPrintfLine(
+        "$MAG_DIAG,BOARD,corrected_mag_uT=%.2f/%.2f/%.2f,mag_yaw_deg=%.2f,compass_deg=%.2f,valid=%u",
+        status.board_corrected_magnetic_uT[0],
+        status.board_corrected_magnetic_uT[1],
+        status.board_corrected_magnetic_uT[2],
+        headingDegrees(status.board_magnetic_yaw_rad),
+        compassDegrees(status.board_magnetic_yaw_rad),
+        status.board_magnetic_yaw_valid ? 1U : 0U);
+    serialPrintfLine(
+        "$MAG_DIAG,CAN,mag_yaw_deg=%.2f,compass_deg=%.2f,valid=%u",
+        headingDegrees(status.can_magnetic_yaw_rad),
+        compassDegrees(status.can_magnetic_yaw_rad),
+        status.can_magnetic_yaw_valid ? 1U : 0U);
 }
 
 void printMagneticCalibration()
@@ -194,16 +267,65 @@ void printMagneticCalibration()
         return;
     }
     serialPrintfLine(
-        "$MAG_CAL,source=BOARD,valid=%u,active=%u,result=%s,samples=%lu/%u,rms_uT=%.3f,offset_x=%.3f,offset_y=%.3f,offset_z=%.3f",
+        "$MAG_CAL,source=BOARD,valid=%u,active=%u,result=%s,need=%s,progress=%u,samples=%lu/%u,bins=%u/%u,range_uT=%.1f/%.1f/%.1f,eigen_ratio=%.3f,rms_uT=%.3f,offset_x=%.3f,offset_y=%.3f,offset_z=%.3f",
         status.magnetic_calibration_valid ? 1U : 0U,
         status.magnetic_calibrating ? 1U : 0U,
         magneticCalibrationResultName(status.magnetic_calibration_result),
+        magneticCalibrationNeedName(status.magnetic_calibration_need),
+        static_cast<unsigned>(
+            status.magnetic_calibration_progress_percent),
         static_cast<unsigned long>(status.magnetic_calibration_samples),
         static_cast<unsigned>(status.magnetic_calibration_target_samples),
+        static_cast<unsigned>(status.magnetic_calibration_direction_bins),
+        static_cast<unsigned>(
+            status.magnetic_calibration_target_direction_bins),
+        status.magnetic_calibration_axis_range_uT[0],
+        status.magnetic_calibration_axis_range_uT[1],
+        status.magnetic_calibration_axis_range_uT[2],
+        status.magnetic_calibration_eigenvalue_ratio,
         status.magnetic_calibration_rms_uT,
         status.magnetic_hard_iron_uT[0],
         status.magnetic_hard_iron_uT[1],
         status.magnetic_hard_iron_uT[2]);
+    char current[32]{};
+    magneticDirectionName(
+        status.magnetic_calibration_current_direction,
+        current, sizeof(current));
+    char low_directions[400]{};
+    size_t used = 0;
+    uint8_t listed = 0;
+    for (uint8_t count = 0;
+         count < Domain::Localization::MagneticCalibrator::MINIMUM_SAMPLES_PER_BIN &&
+         listed < 12U; ++count) {
+        for (uint8_t bin = 0; bin < 26U && listed < 12U; ++bin) {
+            if (status.magnetic_calibration_direction_counts[bin] != count) {
+                continue;
+            }
+            char name[32]{};
+            magneticDirectionName(bin, name, sizeof(name));
+            const int written = snprintf(
+                low_directions + used, sizeof(low_directions) - used,
+                "%s%s:%u", listed == 0U ? "" : "|", name,
+                static_cast<unsigned>(count));
+            if (written < 0 ||
+                static_cast<size_t>(written) >=
+                    sizeof(low_directions) - used) {
+                break;
+            }
+            used += static_cast<size_t>(written);
+            ++listed;
+        }
+    }
+    serialPrintfLine(
+        "$MAG_CAL,DIRECTIONS,frame=BODY_FIELD,current=%s,current_count=%u,low=%s%s",
+        current,
+        status.magnetic_calibration_current_direction < 26U
+            ? static_cast<unsigned>(
+                status.magnetic_calibration_direction_counts[
+                    status.magnetic_calibration_current_direction])
+            : 0U,
+        listed == 0U ? "NONE" : low_directions,
+        listed == 12U ? "|..." : "");
     for (uint8_t row = 0; row < 3; ++row) {
         serialPrintfLine("$MAG_CAL,M%u=%.6f,%.6f,%.6f",
             static_cast<unsigned>(row),
@@ -486,8 +608,12 @@ void handleCommand(char command, DebugState& state, uint32_t now_ms)
             const LocalizationDebugCommand request =
                 LocalizationDebugCommand::CalibrateMagnetic;
             if (sendLocalizationCommand(request)) {
-                serialWriteLine(
-                    "$MAG_CAL,COLLECTING,source=BOARD,samples=1200,rotate_all_axes=1");
+                serialPrintfLine(
+                    "$MAG_CAL,COLLECTING,source=BOARD,target=%u,max=%u,rotate_all_axes=1",
+                    static_cast<unsigned>(Domain::Localization::
+                        MagneticCalibrator::MINIMUM_SAMPLE_COUNT),
+                    static_cast<unsigned>(Domain::Localization::
+                        MagneticCalibrator::SAMPLE_CAPACITY));
             }
             break;
         }
